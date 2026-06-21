@@ -75,10 +75,34 @@ public:
         StreamCallback callback
     );
 
+    // Run TTS with reference audio for voice cloning.
+    // ref_audio: float32 mono PCM at model sample_rate (44.1kHz)
+    // ref_text: transcript of the reference audio
+    TTSOutput run_with_ref_audio(
+        const float* ref_audio, int ref_num_samples,
+        const std::string& ref_text,
+        const std::string& target_text,
+        int max_new_tokens, float temperature, float top_p, int top_k, int seed
+    );
+
+    // Streaming variant of run_with_ref_audio().
+    TTSOutput run_with_ref_audio_streaming(
+        const float* ref_audio, int ref_num_samples,
+        const std::string& ref_text,
+        const std::string& target_text,
+        int max_new_tokens, float temperature, float top_p, int top_k, int seed,
+        StreamCallback callback
+    );
+
     // Expose the pipeline's output sample rate (from DAC config)
     int sample_rate() const;
 
 private:
+    // Build an in-memory prompt tensor for voice cloning. Writes temp .bin file, returns path.
+    std::string build_ref_prompt_file(
+        const int32_t* codes, int num_codebooks, int code_len,
+        const std::string& ref_text, const std::string& target_text
+    );
     std::unique_ptr<DualAREngine> dual_ar_;
     std::unique_ptr<DACEngine> dac_;
     std::unique_ptr<BlockManager> block_mgr_;

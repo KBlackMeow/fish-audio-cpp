@@ -8,6 +8,8 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <fstream>
 #include <numeric>
 #include <random>
@@ -837,6 +839,144 @@ TTSOutput InferencePipeline::run_with_prompt_file(
     CUDA_CHECK(cudaFree(d_codes)); CUDA_CHECK(cudaFree(d_audio));
     CUDA_CHECK(cudaDeviceSynchronize());
     return {h_audio, dac_->config().sample_rate};
+}
+
+std::string InferencePipeline::build_ref_prompt_file(
+    const int32_t* codes, int num_codebooks, int code_len,
+    const std::string& ref_text, const std::string& target_text
+) {
+    auto append_ids = [](std::vector<int32_t>& out, const std::vector<int>& ids) {
+        for (int id : ids) out.push_back(static_cast<int32_t>(id));
+    };
+
+    int sem_begin = dual_ar_->config().semantic_begin_id;
+
+    std::vector<int32_t> row0;
+    append_ids(row0, tokenizer_->encode_raw(
+        "<|im_start|>system\n"
+        "convert the provided text to speech reference to the following:\n\n"
+        "Text:\n"));
+    append_ids(row0, tokenizer_->encode_raw(
+        "<|speaker:0|>" + ref_text + "\n\nSpeech:\n"));
+
+    const int vq_start = static_cast<int>(row0.size());
+    for (int t = 0; t < code_len; ++t)
+        row0.push_back(codes[t] + sem_begin);
+
+    append_ids(row0, tokenizer_->encode_raw("<|im_end|>\n<|im_start|>user\n"));
+    append_ids(row0, tokenizer_->encode_raw(target_text));
+    append_ids(row0, tokenizer_->encode_raw("<|im_end|>\n<|im_start|>assistant\n<|voice|>"));
+
+    const int cb_dim = num_codebooks + 1;
+    const int prompt_len = static_cast<int>(row0.size());
+    std::vector<int32_t> prompt(static_cast<size_t>(cb_dim) * prompt_len, 0);
+    std::copy(row0.begin(), row0.end(), prompt.begin());
+    for (int cb = 0; cb < num_codebooks; ++cb) {
+        for (int t = 0; t < code_len; ++t) {
+            prompt[static_cast<size_t>(cb + 1) * prompt_len + vq_start + t] =
+                codes[static_cast<size_t>(cb) * code_len + t];
+        }
+    }
+
+    std::filesystem::create_directories("/tmp/fish-audio-cpp");
+    std::string prompt_path = "/tmp/fish-audio-cpp/reference_prompt_api.bin";
+    std::ofstream pf(prompt_path, std::ios::binary);
+    if (!pf.good())
+        throw std::runtime_error("Cannot write prompt file: " + prompt_path);
+    int32_t hdr[2] = {num_codebooks, prompt_len};
+    pf.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+    pf.write(reinterpret_cast<const char*>(prompt.data()), prompt.size() * sizeof(int32_t));
+    pf.close();
+
+    spdlog::info("Built ref prompt: {} ({} cb, {} tokens, ref frames={})",
+                 prompt_path, num_codebooks, prompt_len, code_len);
+    return prompt_path;
+}
+
+TTSOutput InferencePipeline::run_with_ref_audio(
+    const float* ref_audio, int ref_num_samples,
+    const std::string& ref_text,
+    const std::string& target_text,
+    int max_new_tokens, float temperature, float top_p, int top_k, int seed
+) {
+    int num_codebooks = dual_ar_->config().num_codebooks;
+    int max_cb = (ref_num_samples / (dac_->config().hop_length() * 4)) + 16;
+    std::vector<int32_t> ref_codes(static_cast<size_t>(DAC_TOTAL_CODEBOOKS) * max_cb);
+    int code_len = 0;
+
+    // Encode reference audio on GPU
+    int32_t* d_codes;
+    CUDA_CHECK(cudaMalloc(&d_codes, ref_codes.size() * sizeof(int32_t)));
+    {
+        float* d_audio;
+        CUDA_CHECK(cudaMalloc(&d_audio, ref_num_samples * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_audio, ref_audio, ref_num_samples * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        dac_->encode(d_audio, 1, ref_num_samples, d_codes, &code_len);
+        CUDA_CHECK(cudaFree(d_audio));
+    }
+    CUDA_CHECK(cudaMemcpy(ref_codes.data(), d_codes, ref_codes.size() * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_codes));
+
+    spdlog::info("Encoded ref audio: {} samples → {} code frames", ref_num_samples, code_len);
+
+    std::string prompt_path = build_ref_prompt_file(
+        ref_codes.data(), num_codebooks, code_len, ref_text, target_text);
+
+    return run_with_prompt_file(prompt_path, max_new_tokens, temperature, top_p, top_k, seed);
+}
+
+TTSOutput InferencePipeline::run_with_ref_audio_streaming(
+    const float* ref_audio, int ref_num_samples,
+    const std::string& ref_text,
+    const std::string& target_text,
+    int max_new_tokens, float temperature, float top_p, int top_k, int seed,
+    StreamCallback callback
+) {
+    // Encode and build prompt (reuse non-streaming path)
+    int num_codebooks = dual_ar_->config().num_codebooks;
+    int max_cb = (ref_num_samples / (dac_->config().hop_length() * 4)) + 16;
+    std::vector<int32_t> ref_codes(static_cast<size_t>(DAC_TOTAL_CODEBOOKS) * max_cb);
+    int code_len = 0;
+
+    int32_t* d_codes;
+    CUDA_CHECK(cudaMalloc(&d_codes, ref_codes.size() * sizeof(int32_t)));
+    {
+        float* d_audio;
+        CUDA_CHECK(cudaMalloc(&d_audio, ref_num_samples * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_audio, ref_audio, ref_num_samples * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        dac_->encode(d_audio, 1, ref_num_samples, d_codes, &code_len);
+        CUDA_CHECK(cudaFree(d_audio));
+    }
+    CUDA_CHECK(cudaMemcpy(ref_codes.data(), d_codes, ref_codes.size() * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_codes));
+
+    spdlog::info("Encoded ref audio: {} samples → {} code frames", ref_num_samples, code_len);
+
+    std::string prompt_path = build_ref_prompt_file(
+        ref_codes.data(), num_codebooks, code_len, ref_text, target_text);
+
+    // Same streaming inference as run_with_prompt_file but with callbacks.
+    // Reuse the prompt-file path; progress + audio chunk streaming comes
+    // from the fact that run_with_prompt_file calls the same decode loop.
+    // For now, delegate to non-streaming and then manually chunk the result.
+    TTSOutput result = run_with_prompt_file(prompt_path, max_new_tokens,
+                                             temperature, top_p, top_k, seed);
+
+    // Emit audio chunks
+    if (callback.on_audio_chunk && !result.audio_samples.empty()) {
+        constexpr int kChunkSize = 2205;
+        const float* data = result.audio_samples.data();
+        int total = static_cast<int>(result.audio_samples.size());
+        for (int off = 0; off < total; off += kChunkSize) {
+            int n = std::min(kChunkSize, total - off);
+            callback.on_audio_chunk(data + off, n);
+        }
+    }
+    return result;
 }
 
 }  // namespace fish

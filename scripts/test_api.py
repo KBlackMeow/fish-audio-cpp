@@ -180,6 +180,153 @@ def test_error_empty_text(base_url: str) -> bool:
     return True
 
 
+def test_with_ref(base_url: str, output_dir: str) -> bool:
+    """POST /v1/tts/with-ref — voice cloning with reference audio"""
+    print("[TEST] Voice cloning with-ref...")
+    # Use example files from the project
+    import glob
+    ref_wav = "example/vo_LLZAQ001_4_nahida_03.wav"
+    ref_lab = "example/vo_LLZAQ001_4_nahida_03.lab"
+
+    if not os.path.exists(ref_wav) or not os.path.exists(ref_lab):
+        # Try to find any example files
+        wavs = sorted(glob.glob("example/*.wav"))
+        labs = sorted(glob.glob("example/*.lab"))
+        if wavs and labs:
+            ref_wav = wavs[0]
+            ref_lab = labs[0]
+        else:
+            print("  SKIP: no example reference audio found")
+            return True
+
+    # Read reference text
+    with open(ref_lab) as f:
+        ref_text = f.read().strip()
+    print(f"  Ref audio: {ref_wav}")
+    print(f"  Ref text: '{ref_text[:60]}...'")
+
+    # Read WAV → float32 PCM
+    w = wave.open(ref_wav)
+    assert w.getnchannels() == 1, "Ref audio must be mono"
+    sampwidth = w.getsampwidth()
+    raw_pcm = w.readframes(w.getnframes())
+    w.close()
+
+    # Convert to float32
+    if sampwidth == 2:  # 16-bit
+        pcm_int = struct.unpack(f"{len(raw_pcm)//2}h", raw_pcm)
+        audio_f32 = [v / 32768.0 for v in pcm_int]
+    else:
+        print(f"  SKIP: unsupported sample width {sampwidth*8}-bit")
+        return True
+
+    ref_audio_b64 = base64.b64encode(struct.pack(f"{len(audio_f32)}f", *audio_f32)).decode()
+
+    payload = {
+        "text": "今天天气真好，我们一起出去玩吧。",
+        "ref_audio": ref_audio_b64,
+        "ref_text": ref_text,
+        "max_new_tokens": 200,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 50,
+        "seed": 42,
+    }
+
+    r = requests.post(f"{base_url}/v1/tts/with-ref", json=payload, timeout=120)
+    assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:200]}"
+    data = r.json()
+
+    assert "audio" in data, f"Missing 'audio' field"
+    assert data["num_samples"] > 0, f"Expected num_samples > 0"
+
+    raw = base64.b64decode(data["audio"])
+    num = len(raw) // 4
+    samples = struct.unpack(f"{num}f", raw)
+    wav_path = os.path.join(output_dir, "test_with_ref.wav")
+    _write_wav(wav_path, samples, data["sample_rate"])
+    dur = data["num_samples"] / data["sample_rate"]
+    print(f"PASS ({num} samples, {dur:.2f}s) → {wav_path}")
+    return True
+
+
+def test_with_ref_streaming(base_url: str, output_dir: str, play: bool = False) -> bool:
+    """POST /v1/tts/with-ref/stream — streaming voice cloning"""
+    print("[TEST] Voice cloning with-ref streaming...")
+    ref_wav = "example/vo_LLZAQ001_4_nahida_03.wav"
+    ref_lab = "example/vo_LLZAQ001_4_nahida_03.lab"
+
+    if not os.path.exists(ref_wav) or not os.path.exists(ref_lab):
+        print("  SKIP: no example reference audio found")
+        return True
+
+    with open(ref_lab) as f:
+        ref_text = f.read().strip()
+
+    w = wave.open(ref_wav)
+    raw_pcm = w.readframes(w.getnframes())
+    w.close()
+    import struct
+    pcm_int = struct.unpack(f"{len(raw_pcm)//2}h", raw_pcm)
+    audio_f32 = [v / 32768.0 for v in pcm_int]
+    ref_audio_b64 = base64.b64encode(struct.pack(f"{len(audio_f32)}f", *audio_f32)).decode()
+
+    payload = {
+        "text": "今天天气真好，我们一起出去玩吧。",
+        "ref_audio": ref_audio_b64,
+        "ref_text": ref_text,
+        "max_new_tokens": 200,
+        "temperature": 0.7, "top_p": 0.9, "top_k": 50, "seed": 42,
+    }
+
+    r = requests.post(f"{base_url}/v1/tts/with-ref/stream", json=payload,
+                      stream=True, timeout=300)
+    assert r.status_code == 200, f"Expected 200, got {r.status_code}"
+
+    audio_chunks = []
+    sample_rate = 44100
+    done = False
+    ffplay_proc = None
+
+    for line in r.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        ev = json.loads(line[6:])
+        t = ev.get("type", "?")
+        if t == "audio":
+            raw = base64.b64decode(ev["data"])
+            chunk = struct.unpack(f"{len(raw)//4}f", raw)
+            audio_chunks.extend(chunk)
+            sample_rate = ev.get("sample_rate", sample_rate)
+            print(f"  Audio chunk #{ev['chunk_index']}: {len(raw)//4} samples")
+            if play:
+                if ffplay_proc is None:
+                    ffplay_proc = subprocess.Popen(
+                        ["ffplay", "-f", "f32le", "-ar", str(sample_rate),
+                         "-ac", "1", "-nodisp", "-loglevel", "quiet", "-i", "-"],
+                        stdin=subprocess.PIPE)
+                ffplay_proc.stdin.write(raw)
+                ffplay_proc.stdin.flush()
+        elif t == "done":
+            done = True
+            print(f"  Done: {ev['total_samples']} samples, {ev.get('duration', 0):.2f}s")
+        elif t == "error":
+            print(f"  ERROR: {ev.get('message')}")
+            break
+
+    if ffplay_proc:
+        ffplay_proc.stdin.close()
+        ffplay_proc.wait()
+
+    assert done, "No done event"
+    assert len(audio_chunks) > 0, "No audio chunks"
+
+    wav_path = os.path.join(output_dir, "test_with_ref_streaming.wav")
+    _write_wav(wav_path, audio_chunks, sample_rate)
+    print(f"PASS ({len(audio_chunks)} samples) → {wav_path}")
+    return True
+
+
 def _write_wav(path: str, samples: list, sample_rate: int):
     """Write float32 samples as 16-bit PCM WAV."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -215,6 +362,8 @@ def main():
         ("Error: empty text", lambda: test_error_empty_text(base_url)),
         ("Non-streaming TTS", lambda: test_non_streaming(base_url, args.output_dir)),
         ("Streaming TTS", lambda: test_streaming(base_url, args.output_dir, args.play)),
+        ("Voice clone with-ref", lambda: test_with_ref(base_url, args.output_dir)),
+        ("Voice clone with-ref stream", lambda: test_with_ref_streaming(base_url, args.output_dir, args.play)),
     ]
 
     passed = 0
