@@ -13,10 +13,9 @@ import base64
 import json
 import os
 import struct
+import subprocess
 import sys
-import tempfile
 import wave
-from pathlib import Path
 
 try:
     import requests
@@ -80,8 +79,8 @@ def test_non_streaming(base_url: str, output_dir: str) -> bool:
     return True
 
 
-def test_streaming(base_url: str, output_dir: str) -> bool:
-    """POST /v1/tts/stream — SSE streaming TTS"""
+def test_streaming(base_url: str, output_dir: str, play: bool = False) -> bool:
+    """POST /v1/tts/stream — SSE streaming TTS, optionally play in real-time"""
     print("[TEST] Streaming TTS...")
     payload = {
         "text": "今天天气真不错，适合出门散步。",
@@ -92,7 +91,6 @@ def test_streaming(base_url: str, output_dir: str) -> bool:
         "seed": 123,
     }
 
-    # Use stream=True to read SSE events as they arrive
     r = requests.post(f"{base_url}/v1/tts/stream", json=payload,
                       stream=True, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}"
@@ -102,6 +100,7 @@ def test_streaming(base_url: str, output_dir: str) -> bool:
     sample_rate = 44100
     done = False
     error = None
+    ffplay_proc = None
 
     for line in r.iter_lines(decode_unicode=True):
         if not line:
@@ -109,35 +108,46 @@ def test_streaming(base_url: str, output_dir: str) -> bool:
         if not line.startswith("data: "):
             continue
 
-        data_str = line[6:]  # strip "data: " prefix
-        try:
-            ev = json.loads(data_str)
-        except json.JSONDecodeError:
-            print(f"  [WARN] Invalid JSON in SSE: {data_str[:80]}")
-            continue
-
+        ev = json.loads(line[6:])
         ev_type = ev.get("type", "?")
+
         if ev_type == "progress":
             progress_count += 1
             if progress_count <= 3 or progress_count % 20 == 0:
                 print(f"  Progress: {ev['current']}/{ev['total']}")
         elif ev_type == "audio":
             raw = base64.b64decode(ev["data"])
-            num = len(raw) // 4
-            chunk = struct.unpack(f"{num}f", raw)
+            chunk = struct.unpack(f"{len(raw)//4}f", raw)
             audio_chunks.extend(chunk)
             sample_rate = ev.get("sample_rate", sample_rate)
-            print(f"  Audio chunk #{ev['chunk_index']}: {num} samples")
+            print(f"  Audio chunk #{ev['chunk_index']}: {len(raw)//4} samples")
+
+            # Real-time playback: spawn ffplay on first chunk, feed subsequent ones
+            if play:
+                if ffplay_proc is None:
+                    ffplay_proc = subprocess.Popen(
+                        ["ffplay", "-f", "f32le", "-ar", str(sample_rate),
+                         "-ac", "1", "-nodisp", "-loglevel", "quiet", "-i", "-"],
+                        stdin=subprocess.PIPE)
+                ffplay_proc.stdin.write(raw)
+                ffplay_proc.stdin.flush()
+
         elif ev_type == "done":
             done = True
             dur = ev.get("duration", 0)
-            print(f"  Done: {ev['total_samples']} samples, {dur:.2f}s")
+            total = ev.get("total_samples", 0)
+            print(f"  Done: {total} samples, {dur:.2f}s")
         elif ev_type == "error":
             error = ev.get("message", "unknown error")
             print(f"  ERROR: {error}")
             break
         else:
             print(f"  Unknown event: {ev_type}")
+
+    # Close ffplay stdin → it finishes playback
+    if ffplay_proc:
+        ffplay_proc.stdin.close()
+        ffplay_proc.wait()
 
     assert done, "Did not receive 'done' event"
     assert error is None, f"Received error event: {error}"
@@ -191,34 +201,36 @@ def main():
     parser = argparse.ArgumentParser(description="Test fish-audio-cpp REST API")
     parser.add_argument("--host", default="127.0.0.1", help="Server host")
     parser.add_argument("--port", default=8080, type=int, help="Server port")
+    parser.add_argument("--output-dir", default="output", help="Output directory for WAV files")
+    parser.add_argument("--play", action="store_true", help="Play streaming audio in real-time via ffplay")
     args = parser.parse_args()
 
     base_url = f"http://{args.host}:{args.port}"
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tests = [
-            ("Health", lambda: test_health(base_url)),
-            ("Info", lambda: test_info(base_url)),
-            ("Error: missing text", lambda: test_error_missing_text(base_url)),
-            ("Error: empty text", lambda: test_error_empty_text(base_url)),
-            ("Non-streaming TTS", lambda: test_non_streaming(base_url, tmpdir)),
-            ("Streaming TTS", lambda: test_streaming(base_url, tmpdir)),
-        ]
+    tests = [
+        ("Health", lambda: test_health(base_url)),
+        ("Info", lambda: test_info(base_url)),
+        ("Error: missing text", lambda: test_error_missing_text(base_url)),
+        ("Error: empty text", lambda: test_error_empty_text(base_url)),
+        ("Non-streaming TTS", lambda: test_non_streaming(base_url, args.output_dir)),
+        ("Streaming TTS", lambda: test_streaming(base_url, args.output_dir, args.play)),
+    ]
 
-        passed = 0
-        failed = 0
-        for name, fn in tests:
-            try:
-                fn()
-                passed += 1
-            except Exception as e:
-                print(f"[FAIL] {name}: {e}")
-                failed += 1
+    passed = 0
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            passed += 1
+        except Exception as e:
+            print(f"[FAIL] {name}: {e}")
+            failed += 1
 
-        print(f"\n{'='*40}")
-        print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")
-        if failed > 0:
-            sys.exit(1)
+    print(f"\n{'='*40}")
+    print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")
+    if failed > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
