@@ -1,0 +1,163 @@
+#include "model/loader.h"
+#include <spdlog/spdlog.h>
+#include <cuda_runtime.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+
+namespace fish {
+
+ModelLoader::~ModelLoader() {
+    unload();
+}
+
+ModelLoader::ModelLoader(ModelLoader&& other) noexcept
+    : fd_(other.fd_)
+    , mapped_data_(other.mapped_data_)
+    , mapped_size_(other.mapped_size_)
+    , headers_(std::move(other.headers_))
+    , data_section_offset_(other.data_section_offset_)
+{
+    other.fd_ = -1;
+    other.mapped_data_ = nullptr;
+    other.mapped_size_ = 0;
+}
+
+ModelLoader& ModelLoader::operator=(ModelLoader&& other) noexcept {
+    if (this != &other) {
+        if (fd_ >= 0) unload();
+        fd_ = other.fd_;
+        mapped_data_ = other.mapped_data_;
+        mapped_size_ = other.mapped_size_;
+        headers_ = std::move(other.headers_);
+        data_section_offset_ = other.data_section_offset_;
+        other.fd_ = -1;
+        other.mapped_data_ = nullptr;
+        other.mapped_size_ = 0;
+    }
+    return *this;
+}
+
+bool ModelLoader::load(const std::string& bin_path) {
+    // Release any previously loaded model first
+    if (fd_ >= 0) unload();
+
+    fd_ = open(bin_path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+        spdlog::error("Failed to open model file: {}", bin_path);
+        return false;
+    }
+
+    struct stat st;
+    if (fstat(fd_, &st) < 0) {
+        spdlog::error("Failed to stat model file");
+        close(fd_);
+        fd_ = -1;
+        return false;
+    }
+    mapped_size_ = st.st_size;
+
+    mapped_data_ = mmap(nullptr, mapped_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+    if (mapped_data_ == MAP_FAILED) {
+        spdlog::error("Failed to mmap model file");
+        close(fd_);
+        fd_ = -1;
+        return false;
+    }
+
+    // Parse header
+    const uint8_t* ptr = static_cast<const uint8_t*>(mapped_data_);
+
+    uint32_t magic;
+    std::memcpy(&magic, ptr, 4);
+    ptr += 4;
+    if (magic != MAGIC) {
+        spdlog::error("Invalid magic: 0x{:08X}, expected 0x{:08X}", magic, MAGIC);
+        unload();
+        return false;
+    }
+
+    uint32_t version;
+    std::memcpy(&version, ptr, 4);
+    ptr += 4;
+    if (version != FORMAT_VERSION) {
+        spdlog::error("Unsupported version: {}", version);
+        unload();
+        return false;
+    }
+
+    uint32_t num_tensors;
+    std::memcpy(&num_tensors, ptr, 4);
+    ptr += 4;
+
+    spdlog::info("Loading {} tensors from {}", num_tensors, bin_path);
+
+    for (uint32_t i = 0; i < num_tensors; i++) {
+        TensorHeader hdr;
+        std::memcpy(&hdr, ptr, sizeof(TensorHeader));
+        ptr += sizeof(TensorHeader);
+
+        std::string name(hdr.name);
+        headers_[name] = hdr;
+
+        spdlog::debug("  [{}] {} shape[{}] dtype={} size={}",
+                      i, name, hdr.ndim, hdr.dtype_val, hdr.data_size);
+    }
+
+    data_section_offset_ = ptr - static_cast<const uint8_t*>(mapped_data_);
+    spdlog::info("Loaded {} tensors, data section at offset {}",
+                 num_tensors, data_section_offset_);
+    return true;
+}
+
+TensorView ModelLoader::get(const std::string& name) const {
+    auto it = headers_.find(name);
+    if (it == headers_.end()) {
+        throw std::runtime_error("Tensor not found: " + name);
+    }
+
+    const TensorHeader& hdr = it->second;
+    TensorView view;
+    view.data = static_cast<char*>(mapped_data_) + hdr.data_offset;
+    view.dtype = static_cast<DType>(hdr.dtype_val);
+    view.shape.assign(hdr.shape, hdr.shape + hdr.ndim);
+    return view;
+}
+
+bool ModelLoader::has(const std::string& name) const {
+    return headers_.count(name) > 0;
+}
+
+bool ModelLoader::pin_memory() {
+    if (!mapped_data_ || mapped_data_ == MAP_FAILED) {
+        spdlog::error("pin_memory: no mapped data");
+        return false;
+    }
+    cudaError_t err = cudaHostRegister(mapped_data_, mapped_size_,
+                                       cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        spdlog::error("pin_memory failed: {} ({} MB)",
+                      cudaGetErrorString(err), mapped_size_ / (1024*1024));
+        return false;
+    }
+    spdlog::info("Pinned {} MB for GPU access", mapped_size_ / (1024*1024));
+    return true;
+}
+
+void ModelLoader::unload() {
+    if (mapped_data_ && mapped_data_ != MAP_FAILED) {
+        cudaHostUnregister(const_cast<void*>(mapped_data_));
+        munmap(mapped_data_, mapped_size_);
+        mapped_data_ = nullptr;
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+        fd_ = -1;
+    }
+    headers_.clear();
+    mapped_size_ = 0;
+}
+
+}  // namespace fish
