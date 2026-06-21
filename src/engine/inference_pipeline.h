@@ -4,6 +4,7 @@
 #include "engine/dac_engine.h"
 #include "engine/block_manager.h"
 #include "tokenizer/tokenizer.h"
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -12,6 +13,16 @@ namespace fish {
 struct TTSOutput {
     std::vector<float> audio_samples;  // PCM float32, mono
     int sample_rate = 0;
+};
+
+// Callbacks for streaming inference.
+// All callbacks are called from the inference thread.
+struct StreamCallback {
+    // Called once per AR decode step. current is 0-indexed step number.
+    std::function<void(int current, int total)> on_progress;
+    // Called for each audio chunk after DAC decode completes.
+    // Chunks are ~50ms (2205 samples at 44.1kHz).
+    std::function<void(const float* samples, int count)> on_audio_chunk;
 };
 
 class InferencePipeline {
@@ -53,6 +64,15 @@ public:
         float top_p = 0.9f,
         int top_k = 30,
         int seed = 42
+    );
+
+    // Streaming variant of run(). Reports progress during AR generation
+    // and streams audio chunks after DAC decode. Returns full TTSOutput.
+    TTSOutput run_streaming(
+        const std::string& text,
+        int max_new_tokens,
+        float temperature, float top_p, int top_k, int seed,
+        StreamCallback callback
     );
 
 private:

@@ -59,6 +59,19 @@ TTSOutput InferencePipeline::run(
     int top_k,
     int seed
 ) {
+    StreamCallback noop;
+    return run_streaming(text, max_new_tokens, temperature, top_p, top_k, seed, noop);
+}
+
+TTSOutput InferencePipeline::run_streaming(
+    const std::string& text,
+    int max_new_tokens,
+    float temperature,
+    float top_p,
+    int top_k,
+    int seed,
+    StreamCallback callback
+) {
     spdlog::info("InferencePipeline::run: text='{}' max_new={}", text, max_new_tokens);
 
     // ── Use DualAR's stream for ALL GPU operations (no separate pipeline stream) ──
@@ -445,6 +458,11 @@ TTSOutput InferencePipeline::run(
         generated.push_back(sem);
         for (auto c : curr_cbs) generated.push_back(c);
 
+        // Streaming: report progress
+        if (callback.on_progress) {
+            callback.on_progress(step, max_new_tokens);
+        }
+
         // Diagnostic: log first 5 semantic tokens + codebook ranges
         if (step < 5) {
             spdlog::info("  step={} sem={} (normal={} high={}) cb0={} cb1={} cb_last={}",
@@ -523,6 +541,17 @@ TTSOutput InferencePipeline::run(
     std::vector<float> h_audio(audio_len);
     CUDA_CHECK(cudaMemcpy(h_audio.data(), d_audio,
                           audio_len * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Streaming: emit audio chunks (~50ms each)
+    if (callback.on_audio_chunk) {
+        constexpr int kChunkSize = 2205;  // ~50ms at 44.1kHz
+        int offset = 0;
+        while (offset < audio_len) {
+            int chunk = std::min(kChunkSize, audio_len - offset);
+            callback.on_audio_chunk(h_audio.data() + offset, chunk);
+            offset += chunk;
+        }
+    }
 
     spdlog::info("  Audio: {} samples ({:.2f}s @ {}Hz)",
                  audio_len, static_cast<double>(audio_len) / dac_->config().sample_rate,
