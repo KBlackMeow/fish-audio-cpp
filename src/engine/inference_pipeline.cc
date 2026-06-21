@@ -904,20 +904,13 @@ TTSOutput InferencePipeline::run_with_ref_audio(
     std::vector<int32_t> ref_codes(static_cast<size_t>(DAC_TOTAL_CODEBOOKS) * max_cb);
     int code_len = 0;
 
-    // Encode reference audio on GPU
-    int32_t* d_codes;
-    CUDA_CHECK(cudaMalloc(&d_codes, ref_codes.size() * sizeof(int32_t)));
-    {
-        float* d_audio;
-        CUDA_CHECK(cudaMalloc(&d_audio, ref_num_samples * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_audio, ref_audio, ref_num_samples * sizeof(float),
-                              cudaMemcpyHostToDevice));
-        dac_->encode(d_audio, 1, ref_num_samples, d_codes, &code_len);
-        CUDA_CHECK(cudaFree(d_audio));
-    }
-    CUDA_CHECK(cudaMemcpy(ref_codes.data(), d_codes, ref_codes.size() * sizeof(int32_t),
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_codes));
+    // Upload audio to GPU, encode — codes returned to host by DAC
+    float* d_audio;
+    CUDA_CHECK(cudaMalloc(&d_audio, ref_num_samples * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_audio, ref_audio, ref_num_samples * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    dac_->encode(d_audio, 1, ref_num_samples, ref_codes.data(), &code_len);
+    CUDA_CHECK(cudaFree(d_audio));
 
     spdlog::info("Encoded ref audio: {} samples → {} code frames", ref_num_samples, code_len);
 
@@ -940,28 +933,18 @@ TTSOutput InferencePipeline::run_with_ref_audio_streaming(
     std::vector<int32_t> ref_codes(static_cast<size_t>(DAC_TOTAL_CODEBOOKS) * max_cb);
     int code_len = 0;
 
-    int32_t* d_codes;
-    CUDA_CHECK(cudaMalloc(&d_codes, ref_codes.size() * sizeof(int32_t)));
-    {
-        float* d_audio;
-        CUDA_CHECK(cudaMalloc(&d_audio, ref_num_samples * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_audio, ref_audio, ref_num_samples * sizeof(float),
-                              cudaMemcpyHostToDevice));
-        dac_->encode(d_audio, 1, ref_num_samples, d_codes, &code_len);
-        CUDA_CHECK(cudaFree(d_audio));
-    }
-    CUDA_CHECK(cudaMemcpy(ref_codes.data(), d_codes, ref_codes.size() * sizeof(int32_t),
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_codes));
+    float* d_audio;
+    CUDA_CHECK(cudaMalloc(&d_audio, ref_num_samples * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_audio, ref_audio, ref_num_samples * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    dac_->encode(d_audio, 1, ref_num_samples, ref_codes.data(), &code_len);
+    CUDA_CHECK(cudaFree(d_audio));
 
     spdlog::info("Encoded ref audio: {} samples → {} code frames", ref_num_samples, code_len);
 
     std::string prompt_path = build_ref_prompt_file(
         ref_codes.data(), num_codebooks, code_len, ref_text, target_text);
 
-    // Same streaming inference as run_with_prompt_file but with callbacks.
-    // Reuse the prompt-file path; progress + audio chunk streaming comes
-    // from the fact that run_with_prompt_file calls the same decode loop.
     // For now, delegate to non-streaming and then manually chunk the result.
     TTSOutput result = run_with_prompt_file(prompt_path, max_new_tokens,
                                              temperature, top_p, top_k, seed);
