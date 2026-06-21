@@ -1,5 +1,6 @@
 // src/server/http_server.cc
 #include "server/http_server.h"
+#include "server/routes.h"
 #include <spdlog/spdlog.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -87,6 +88,91 @@ void HttpServer::start() {
             err["error"] = e.what();
             res.set_content(err.dump(), "application/json");
             spdlog::error("TTS error: {}", e.what());
+        }
+    });
+
+    // TTS streaming endpoint (SSE)
+    server_->Post("/v1/tts/stream", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto body = nlohmann::json::parse(req.body);
+            std::string text = body.value("text", "");
+            if (text.empty()) {
+                res.status = 400;
+                res.set_content(routes::error_json("Missing 'text' field"), "application/json");
+                return;
+            }
+
+            int max_tokens  = body.value("max_new_tokens", 512);
+            float temp      = body.value("temperature", 0.7f);
+            float top_p     = body.value("top_p", 0.9f);
+            int top_k       = body.value("top_k", 50);
+            int seed        = body.value("seed", 42);
+
+            spdlog::info("TTS stream: '{}' (max_tokens={})", text.substr(0, 60), max_tokens);
+
+            // SSE headers
+            res.set_header("Content-Type", "text/event-stream");
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("Connection", "keep-alive");
+            res.set_header("X-Accel-Buffering", "no");  // disable nginx buffering
+
+            // Use chunked content provider for SSE
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [this, text, max_tokens, temp, top_p, top_k, seed](
+                    size_t /*offset*/, httplib::DataSink& sink
+                ) -> bool {
+                    StreamCallback cb;
+                    cb.on_progress = [&sink](int current, int total) {
+                        nlohmann::json ev;
+                        ev["current"] = current;
+                        ev["total"] = total;
+                        sink.write(routes::sse_event("progress", ev).data(),
+                                   routes::sse_event("progress", ev).size());
+                    };
+
+                    cb.on_audio_chunk = [&sink, chunk_idx = 0](
+                        const float* samples, int count
+                    ) mutable {
+                        std::string raw(reinterpret_cast<const char*>(samples),
+                                       count * sizeof(float));
+                        std::string b64 = httplib::detail::base64_encode(raw);
+                        nlohmann::json ev;
+                        ev["data"] = b64;
+                        ev["sample_rate"] = 44100;
+                        ev["chunk_index"] = chunk_idx++;
+                        ev["num_samples"] = count;
+                        sink.write(routes::sse_event("audio", ev).data(),
+                                   routes::sse_event("audio", ev).size());
+                    };
+
+                    try {
+                        auto result = pipeline_->run_streaming(
+                            text, max_tokens, temp, top_p, top_k, seed, cb);
+
+                        nlohmann::json done_ev;
+                        done_ev["total_samples"] = static_cast<int>(result.audio_samples.size());
+                        done_ev["duration"] = static_cast<double>(result.audio_samples.size())
+                                              / result.sample_rate;
+                        done_ev["sample_rate"] = result.sample_rate;
+                        sink.write(routes::sse_event("done", done_ev).data(),
+                                   routes::sse_event("done", done_ev).size());
+                    } catch (const std::exception& e) {
+                        nlohmann::json err_ev;
+                        err_ev["message"] = e.what();
+                        sink.write(routes::sse_event("error", err_ev).data(),
+                                   routes::sse_event("error", err_ev).size());
+                        spdlog::error("TTS stream error: {}", e.what());
+                    }
+
+                    sink.done();
+                    return true;
+                }
+            );
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(routes::error_json(e.what()), "application/json");
+            spdlog::error("TTS stream setup error: {}", e.what());
         }
     });
 

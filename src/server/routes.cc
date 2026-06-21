@@ -1,20 +1,18 @@
 // src/server/routes.cc — shared route utilities for the HTTP TTS server
-#include <nlohmann/json.hpp>
+#include "server/routes.h"
 #include <cstdint>
-#include <vector>
-#include <string>
 
 namespace fish::routes {
 
 // Build a JSON error response body
-inline std::string error_json(const std::string& msg) {
+std::string error_json(const std::string& msg) {
     nlohmann::json j;
     j["error"] = msg;
     return j.dump();
 }
 
 // Encode a float32 PCM buffer as base64 for JSON transport
-inline std::string encode_pcm_base64(const float* samples, int n) {
+std::string encode_pcm_base64(const float* samples, int n) {
     // Simple inline base64 encoding
     static const char kBase64[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -32,6 +30,12 @@ inline std::string encode_pcm_base64(const float* samples, int n) {
         out.push_back((i + 2 < nbytes) ? kBase64[val & 0x3F] : '=');
     }
     return out;
+}
+
+std::string sse_event(const std::string& type, const nlohmann::json& data) {
+    nlohmann::json j = data;
+    j["type"] = type;
+    return "data: " + j.dump() + "\n\n";
 }
 
 }  // namespace fish::routes
