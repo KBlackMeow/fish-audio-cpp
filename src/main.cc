@@ -14,6 +14,7 @@
 #include "model/loader.h"
 #include "tokenizer/tokenizer.h"
 #include "utils/cuda_utils.h"
+#include "server/http_server.h"
 #include <spdlog/spdlog.h>
 #include <cxxopts.hpp>
 #include <cuda_runtime.h>
@@ -367,6 +368,12 @@ static int run_main(int argc, char* argv[]) {
         ("output-codes",    "Output path for encoded VQ codes (use with --encode-audio)",
          cxxopts::value<std::string>()->default_value(""))
         ("decode-codes", "Decode VQ codes file to WAV (roundtrip test)", cxxopts::value<std::string>()->default_value(""))
+        ("server",          "Run in HTTP server mode instead of CLI",
+         cxxopts::value<bool>()->default_value("false"))
+        ("host",            "Server bind address",
+         cxxopts::value<std::string>()->default_value("0.0.0.0"))
+        ("port",            "Server port",
+         cxxopts::value<int>()->default_value("8080"))
         ("h,help",         "Print usage");
 
     auto args = opts.parse(argc, argv);
@@ -388,6 +395,9 @@ static int run_main(int argc, char* argv[]) {
     const std::string encode_audio  = args["encode-audio"].as<std::string>();
     const std::string output_codes  = args["output-codes"].as<std::string>();
     const std::string decode_codes = args["decode-codes"].as<std::string>();
+    const bool        server_mode  = args["server"].as<bool>();
+    const std::string server_host  = args["host"].as<std::string>();
+    const int         server_port  = args["port"].as<int>();
 
     spdlog::info("=== Fish Audio S2 Pro TTS ===");
     spdlog::info("  model-dir : {}", model_dir);
@@ -618,24 +628,34 @@ static int run_main(int argc, char* argv[]) {
         std::move(block_mgr),
         std::move(tokenizer));
 
-    fish::TTSOutput result;
-    if (!prompt_file.empty()) {
-        spdlog::info("Using pre-built prompt file: {}", prompt_file);
-        result = pipeline.run_with_prompt_file(prompt_file, max_tokens, temperature, top_p, top_k, seed);
+    if (server_mode) {
+        fish::HttpServer::Config srv_cfg;
+        srv_cfg.host = server_host;
+        srv_cfg.port = server_port;
+        fish::HttpServer srv(srv_cfg, &pipeline);
+        spdlog::info("Starting HTTP server on {}:{}", server_host, server_port);
+        srv.start();  // blocking
+        // server stopped -- cleanup below
     } else {
-        result = pipeline.run(text, max_tokens, temperature, top_p, top_k, seed);
-    }
+        fish::TTSOutput result;
+        if (!prompt_file.empty()) {
+            spdlog::info("Using pre-built prompt file: {}", prompt_file);
+            result = pipeline.run_with_prompt_file(prompt_file, max_tokens, temperature, top_p, top_k, seed);
+        } else {
+            result = pipeline.run(text, max_tokens, temperature, top_p, top_k, seed);
+        }
 
-    if (result.audio_samples.empty()) {
-        spdlog::error("No audio generated");
-        cudnnDestroy(cudnn);
-        cublasDestroy(cublas);
-        cudaStreamDestroy(stream);
-        return 1;
-    }
+        if (result.audio_samples.empty()) {
+            spdlog::error("No audio generated");
+            cudnnDestroy(cudnn);
+            cublasDestroy(cublas);
+            cudaStreamDestroy(stream);
+            return 1;
+        }
 
-    write_wav(output_wav, result.audio_samples.data(),
-              static_cast<int>(result.audio_samples.size()), result.sample_rate);
+        write_wav(output_wav, result.audio_samples.data(),
+                  static_cast<int>(result.audio_samples.size()), result.sample_rate);
+    }
 
     cudnnDestroy(cudnn);
     cublasDestroy(cublas);
