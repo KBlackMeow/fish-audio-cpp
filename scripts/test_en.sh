@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-MODEL_DIR="${MODEL_DIR:-$ROOT_DIR/../checkpoints/s2-pro}"
+MODEL_DIR="${MODEL_DIR:-$ROOT_DIR/checkpoints/s2-pro}"
 REF_AUDIO="${REF_AUDIO:-$ROOT_DIR/example/vo_LLZAQ001_4_nahida_03.wav}"
 REF_TEXT="${REF_TEXT:-$ROOT_DIR/example/vo_LLZAQ001_4_nahida_03.lab}"
 OUTPUT="${OUTPUT:-$ROOT_DIR/output/nahida_en_test.wav}"
