@@ -75,6 +75,9 @@ public:
         StreamCallback callback
     );
 
+    // Expose the pipeline's output sample rate (from DAC config)
+    int sample_rate() const;
+
 private:
     std::unique_ptr<DualAREngine> dual_ar_;
     std::unique_ptr<DACEngine> dac_;

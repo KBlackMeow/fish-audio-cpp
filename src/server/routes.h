@@ -6,7 +6,6 @@
 namespace fish::routes {
 
 std::string error_json(const std::string& msg);
-std::string encode_pcm_base64(const float* samples, int n);
 std::string sse_event(const std::string& type, const nlohmann::json& data);
 
 }  // namespace fish::routes

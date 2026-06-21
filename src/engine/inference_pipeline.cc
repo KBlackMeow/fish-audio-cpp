@@ -51,6 +51,10 @@ InferencePipeline::~InferencePipeline() {
     // No separate stream to destroy — DualAR owns the stream.
 }
 
+int InferencePipeline::sample_rate() const {
+    return dac_->config().sample_rate;
+}
+
 TTSOutput InferencePipeline::run(
     const std::string& text,
     int max_new_tokens,

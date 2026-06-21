@@ -45,9 +45,7 @@ void HttpServer::start() {
             std::string text = body.value("text", "");
             if (text.empty()) {
                 res.status = 400;
-                nlohmann::json err;
-                err["error"] = "Missing 'text' field";
-                res.set_content(err.dump(), "application/json");
+                res.set_content(routes::error_json("Missing 'text' field"), "application/json");
                 return;
             }
 
@@ -59,13 +57,15 @@ void HttpServer::start() {
 
             spdlog::info("TTS: '{}' (max_tokens={})", text.substr(0, 60), max_tokens);
 
-            auto result = pipeline_->run(text, max_tokens, temp, top_p, top_k, seed);
+            TTSOutput result;
+            {
+                std::lock_guard<std::mutex> lock(inference_mutex_);
+                result = pipeline_->run(text, max_tokens, temp, top_p, top_k, seed);
+            }
 
             if (result.audio_samples.empty()) {
                 res.status = 500;
-                nlohmann::json err;
-                err["error"] = "Inference produced no audio";
-                res.set_content(err.dump(), "application/json");
+                res.set_content(routes::error_json("Inference produced no audio"), "application/json");
                 return;
             }
 
@@ -84,9 +84,7 @@ void HttpServer::start() {
             res.set_content(resp.dump(), "application/json");
         } catch (const std::exception& e) {
             res.status = 500;
-            nlohmann::json err;
-            err["error"] = e.what();
-            res.set_content(err.dump(), "application/json");
+            res.set_content(routes::error_json(e.what()), "application/json");
             spdlog::error("TTS error: {}", e.what());
         }
     });
@@ -117,9 +115,10 @@ void HttpServer::start() {
             res.set_header("X-Accel-Buffering", "no");  // disable nginx buffering
 
             // Use chunked content provider for SSE
+            int sr = pipeline_->sample_rate();
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [this, text, max_tokens, temp, top_p, top_k, seed](
+                [this, text, max_tokens, temp, top_p, top_k, seed, sr](
                     size_t /*offset*/, httplib::DataSink& sink
                 ) -> bool {
                     StreamCallback cb;
@@ -131,7 +130,7 @@ void HttpServer::start() {
                                    routes::sse_event("progress", ev).size());
                     };
 
-                    cb.on_audio_chunk = [&sink, chunk_idx = 0](
+                    cb.on_audio_chunk = [&sink, sr, chunk_idx = 0](
                         const float* samples, int count
                     ) mutable {
                         std::string raw(reinterpret_cast<const char*>(samples),
@@ -139,7 +138,7 @@ void HttpServer::start() {
                         std::string b64 = httplib::detail::base64_encode(raw);
                         nlohmann::json ev;
                         ev["data"] = b64;
-                        ev["sample_rate"] = 44100;
+                        ev["sample_rate"] = sr;
                         ev["chunk_index"] = chunk_idx++;
                         ev["num_samples"] = count;
                         sink.write(routes::sse_event("audio", ev).data(),
@@ -147,8 +146,12 @@ void HttpServer::start() {
                     };
 
                     try {
-                        auto result = pipeline_->run_streaming(
-                            text, max_tokens, temp, top_p, top_k, seed, cb);
+                        TTSOutput result;
+                        {
+                            std::lock_guard<std::mutex> lock(inference_mutex_);
+                            result = pipeline_->run_streaming(
+                                text, max_tokens, temp, top_p, top_k, seed, cb);
+                        }
 
                         nlohmann::json done_ev;
                         done_ev["total_samples"] = static_cast<int>(result.audio_samples.size());
@@ -186,6 +189,9 @@ void HttpServer::start() {
     });
 
     spdlog::info("HttpServer listening on {}:{}", cfg_.host, cfg_.port);
+    server_->new_task_queue = [this]() -> httplib::TaskQueue* {
+        return new httplib::ThreadPool(cfg_.num_threads);
+    };
     server_->listen(cfg_.host.c_str(), cfg_.port);
 }
 
