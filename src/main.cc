@@ -356,11 +356,12 @@ static std::string resolve_model_path(
     };
 
     auto dir = std::filesystem::path(model_dir);
-    // Search models/ at project root, then parent, then model_dir, then legacy flat
+    auto model_name = dir.filename().string();  // e.g. "s2-pro"
+    // Search models/<model>-<dtype>/ at project root, then parent, then model_dir
     auto candidates = [&](const std::string& suffix) -> std::vector<std::string> {
-        auto sub = "/models/model-" + suffix + "/" + basename + ".bin";
+        auto sub = "/models/" + model_name + "-" + suffix + "/" + basename + ".bin";
         return {
-            dir.parent_path().parent_path().string() + sub,  // ../../models/ (project root)
+            dir.parent_path().parent_path().string() + sub,  // ../../models/
             dir.parent_path().string() + sub,                // ../models/
             model_dir + sub,                                  // models/ inside model_dir
             model_dir + "/" + basename + "_" + suffix + ".bin",  // legacy flat
