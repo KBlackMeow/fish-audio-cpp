@@ -9,6 +9,7 @@ enum class DType : uint32_t {
     FP32 = 0,
     FP16 = 1,
     BF16 = 2,
+    INT8 = 3,
 };
 
 constexpr int64_t dtype_size(DType dt) {
@@ -16,6 +17,7 @@ constexpr int64_t dtype_size(DType dt) {
         case DType::FP32: return 4;
         case DType::FP16: return 2;
         case DType::BF16: return 2;
+        case DType::INT8: return 1;
     }
     return 0;  // unreachable for valid enum values
 }

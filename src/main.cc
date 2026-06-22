@@ -329,6 +329,23 @@ static std::string build_reference_prompt_file(
     return prompt_path;
 }
 
+// Resolve model file path with precision suffix fallback.
+// Priority: _int8 > _fp16 > _bf16 > unsuffixed (legacy).
+static std::string resolve_model_path(
+    const std::string& model_dir,
+    const std::string& basename)
+{
+    static const char* suffixes[] = {"_int8", "_fp16", "_bf16", ""};
+    for (const char* suf : suffixes) {
+        std::string path = model_dir + "/" + basename + suf + ".bin";
+        if (std::filesystem::exists(path)) {
+            spdlog::info("Resolved model: {}", path);
+            return path;
+        }
+    }
+    return model_dir + "/" + basename + "_fp16.bin";
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -337,7 +354,7 @@ static int run_main(int argc, char* argv[]) {
 
     cxxopts::Options opts("fish-server", "Fish Audio S2 Pro TTS (pure C++)");
     opts.add_options()
-        ("m,model-dir",    "Model directory (dual_ar.bin, dac.bin, configs)",
+        ("m,model-dir",    "Model directory (dual_ar_<dtype>.bin, dac_<dtype>.bin, configs)",
          cxxopts::value<std::string>()->default_value("checkpoints/s2-pro"))
         ("t,text",         "Text to synthesize",
          cxxopts::value<std::string>()->default_value("你好"))
@@ -452,8 +469,9 @@ static int run_main(int argc, char* argv[]) {
                  dual_ar_cfg.codebook_size, dual_ar_cfg.num_codebooks);
 
     fish::ModelLoader dual_ar_loader;
-    if (!dual_ar_loader.load(model_dir + "/dual_ar.bin"))
-        throw std::runtime_error("Failed to load dual_ar.bin");
+    std::string dual_ar_path = resolve_model_path(model_dir, "dual_ar");
+    if (!dual_ar_loader.load(dual_ar_path))
+        throw std::runtime_error("Failed to load " + dual_ar_path);
     // pin_memory() registers 8 GB with CUDA which is very slow in WSL — skip it.
 
     auto dual_ar = std::make_unique<fish::DualAREngine>(
@@ -468,8 +486,9 @@ static int run_main(int argc, char* argv[]) {
     auto dac_cfg = fish::DACConfig::from_json(model_dir + "/dac_config.json");
 
     fish::ModelLoader dac_loader;
-    if (!dac_loader.load(model_dir + "/dac.bin"))
-        throw std::runtime_error("Failed to load dac.bin");
+    std::string dac_path = resolve_model_path(model_dir, "dac");
+    if (!dac_loader.load(dac_path))
+        throw std::runtime_error("Failed to load " + dac_path);
 
     auto dac = std::make_unique<fish::DACEngine>(
         dac_cfg, std::move(dac_loader), cublas, cudnn, stream);
