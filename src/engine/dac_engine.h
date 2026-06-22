@@ -5,9 +5,9 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <unordered_map>
 #include <vector>
 #include <string>
-#include <unordered_map>
 #include <cudnn.h>
 
 namespace fish {
@@ -59,6 +59,9 @@ private:
     cudnnHandle_t cudnn_;
     cudaStream_t stream_;
 
+    bool use_int8_ = false;
+    std::unordered_map<void*, __half*> weight_to_scale_;
+
     // --- RVQ weights on GPU ---
     // Codebook embeddings: [codebook_size, DAC_CODEBOOK_DIM] (FP16)
     // Index 0 = semantic, indices 1..9 = acoustic
@@ -91,6 +94,7 @@ private:
     struct DenseWeight {
         __half* weight = nullptr;
         __half* bias = nullptr;
+        __half* scale = nullptr;   // INT8 per-channel scale (null if FP16)
         int out = 0;
         int in = 0;
     };

@@ -46,6 +46,20 @@ void gemm_fp16_to_f32(int M_out, int N_out, int K,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 
+// Dispatch GEMM: INT8 dequant+GEMM if scale is provided, else FP16 cuBLAS.
+static void quantized_gemm_fp16(int M_out, int N_out, int K,
+                                 const __half* W, const __half* scale,
+                                 const __half* X, __half* Y,
+                                 cublasHandle_t cublas, cudaStream_t stream) {
+    if (scale != nullptr) {
+        kernels::int8_dequant_gemm_fp16(
+            reinterpret_cast<const int8_t*>(W), scale,
+            X, Y, M_out, N_out, K, stream);
+    } else {
+        gemm_fp16(M_out, N_out, K, W, X, Y, cublas);
+    }
+}
+
 std::string rvq_prefix_for_codebook(int cb) {
     if (cb == 0)
         return "quantizer.semantic_quantizer.quantizers.0";
@@ -279,6 +293,15 @@ void DACEngine::load_decoder_weights() {
         for (int i = 0; i < dw.out; ++i) b[i] = half_from_tv(b_tv, i);
         CUDA_CHECK(cudaMalloc(&dw.bias, b.size() * sizeof(__half)));
         CUDA_CHECK(cudaMemcpy(dw.bias, b.data(), b.size() * sizeof(__half), cudaMemcpyHostToDevice));
+
+        // Check for INT8 scale
+        std::string scale_key = base + "_scale";
+        if (loader_.has(scale_key)) {
+            use_int8_ = true;
+            auto s_tv = loader_.get(scale_key);
+            CUDA_CHECK(cudaMalloc(&dw.scale, s_tv.nbytes()));
+            CUDA_CHECK(cudaMemcpy(dw.scale, s_tv.data, s_tv.nbytes(), cudaMemcpyHostToDevice));
+        }
         dense_weights_[base] = dw;
     };
 
@@ -292,6 +315,15 @@ void DACEngine::load_decoder_weights() {
         for (size_t i = 0; i < n; ++i) w[i] = half_from_tv(w_tv, static_cast<int>(i));
         CUDA_CHECK(cudaMalloc(&dw.weight, n * sizeof(__half)));
         CUDA_CHECK(cudaMemcpy(dw.weight, w.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
+
+        // Check for INT8 scale
+        std::string scale_key = key + "_scale";
+        if (loader_.has(scale_key)) {
+            use_int8_ = true;
+            auto s_tv = loader_.get(scale_key);
+            CUDA_CHECK(cudaMalloc(&dw.scale, s_tv.nbytes()));
+            CUDA_CHECK(cudaMemcpy(dw.scale, s_tv.data, s_tv.nbytes(), cudaMemcpyHostToDevice));
+        }
         dense_weights_[key] = dw;
     };
 
@@ -633,16 +665,8 @@ int DACEngine::decode_waveform_native(int batch_size, int code_len, float* audio
         const auto& dw = dense_weights_.at(key);
         int N = B * L;
         kernels::transpose_fp16(src, decoder_buf_d_, Cin, N, L, Cin, stream_);
-        float alpha = 1.0f, beta = 0.0f;
-        CUBLAS_CHECK(cublasGemmEx(cublas_,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            dw.out, N, dw.in,
-            &alpha,
-            dw.weight, CUDA_R_16F, dw.in,
-            decoder_buf_d_, CUDA_R_16F, dw.in,
-            &beta,
-            decoder_buf_c_, CUDA_R_16F, dw.out,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        quantized_gemm_fp16(dw.out, N, dw.in, dw.weight, dw.scale,
+                            decoder_buf_d_, decoder_buf_c_, cublas_, stream_);
         kernels::transpose_fp16(decoder_buf_c_, dst, N, dw.out, dw.out, L, stream_);
         kernels::add_channel_bias(dst, dw.bias, B, dw.out, L, stream_);
         return dw.out;
@@ -672,7 +696,7 @@ int DACEngine::decode_waveform_native(int batch_size, int code_len, float* audio
     auto dense_nobias = [&](const std::string& key, const __half* src, __half* dst,
                             int rows, int in_dim) {
         const auto& dw = dense_weights_.at(key);
-        gemm_fp16(dw.out, rows, in_dim, dw.weight, src, dst, cublas_);
+        quantized_gemm_fp16(dw.out, rows, in_dim, dw.weight, dw.scale, src, dst, cublas_, stream_);
         return dw.out;
     };
 
@@ -934,7 +958,7 @@ int DACEngine::encode_waveform_native(const float* audio, int batch_size, int au
     auto dense_nobias = [&](const std::string& key, const __half* src, __half* dst,
                             int rows, int in_dim) {
         const auto& dw = dense_weights_.at(key);
-        gemm_fp16(dw.out, rows, in_dim, dw.weight, src, dst, cublas_);
+        quantized_gemm_fp16(dw.out, rows, in_dim, dw.weight, dw.scale, src, dst, cublas_, stream_);
         return dw.out;
     };
 
@@ -973,7 +997,8 @@ int DACEngine::encode_waveform_native(const float* audio, int batch_size, int au
         const auto& dw = dense_weights_.at(key);
         int N = Bc * Lc;
         kernels::transpose_fp16(src, decoder_buf_d_, Cin, N, Lc, Cin, stream_);
-        gemm_fp16(dw.out, N, dw.in, dw.weight, decoder_buf_d_, decoder_buf_c_, cublas_);
+        quantized_gemm_fp16(dw.out, N, dw.in, dw.weight, dw.scale,
+                            decoder_buf_d_, decoder_buf_c_, cublas_, stream_);
         kernels::transpose_fp16(decoder_buf_c_, dst, N, dw.out, dw.out, Lc, stream_);
         kernels::add_channel_bias(dst, dw.bias, Bc, dw.out, Lc, stream_);
         return dw.out;
@@ -1226,7 +1251,15 @@ int DACEngine::encode_waveform_native(const float* audio, int batch_size, int au
             kernels::silu_mul_clamp_forward(qkv, out, T * I, 65504.0f, stream_);
             {
                 const auto& dw = dense_weights_.at(pp + ".feed_forward.w2.weight");
-                gemm_fp16_to_f32(dw.out, T, I, dw.weight, qkv, ffn_out_f32, cublas_);
+                if (dw.scale != nullptr) {
+                    // INT8 path: compute FP16 result, then cast to FP32
+                    quantized_gemm_fp16(dw.out, T, I, dw.weight, dw.scale,
+                                        qkv, decoder_buf_c_, cublas_, stream_);
+                    kernels::f16_to_f32_cast(decoder_buf_c_, ffn_out_f32,
+                                             T * dw.out, stream_);
+                } else {
+                    gemm_fp16_to_f32(dw.out, T, I, dw.weight, qkv, ffn_out_f32, cublas_);
+                }
             }
             dump_device_f32("enc_pre_module_layer" + std::to_string(l) + "_ffn", ffn_out_f32, {B, T, D});
             kernels::dim_scale_residual_from_f32(tx, ffn_out_f32,
