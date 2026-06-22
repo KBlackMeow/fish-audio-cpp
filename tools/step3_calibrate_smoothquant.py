@@ -18,7 +18,7 @@ import sys
 import os
 import glob
 import numpy as np
-from quantize_int8 import (
+from step2_quantize_int8 import (
     read_bin, load_tensor, write_bin, should_quantize,
     DTYPE_INT8, DTYPE_FP16, HEADER_SIZE
 )
@@ -156,7 +156,7 @@ def calibrate_and_quantize(calib_dir, input_bin, output_bin):
             arr_smooth = arr_smooth.reshape(arr.shape)
 
             # Quantize smoothed weights
-            from quantize_int8 import quantize_rowwise
+            from step2_quantize_int8 import quantize_rowwise
             w_int8, scale = quantize_rowwise(arr_smooth.astype(np.float16))
 
             # Scale must be adjusted: the smoothed weight W_smooth[m,k] = W[m,k] * smooth[k]
@@ -171,7 +171,7 @@ def calibrate_and_quantize(calib_dir, input_bin, output_bin):
             total_in += info['data_size']
         else:
             # No calibration data — use standard quantization
-            from quantize_int8 import quantize_rowwise
+            from step2_quantize_int8 import quantize_rowwise
             w_int8, scale = quantize_rowwise(arr.astype(np.float16))
             smooth_inv = None
 
