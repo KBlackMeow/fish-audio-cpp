@@ -285,23 +285,31 @@ void DACEngine::load_decoder_weights() {
         dw.out = static_cast<int>(w_tv.shape[0]);
         dw.in = static_cast<int>(w_tv.shape[1]);
         size_t n = static_cast<size_t>(dw.out) * dw.in;
-        std::vector<__half> w(n);
-        for (size_t i = 0; i < n; ++i) w[i] = half_from_tv(w_tv, static_cast<int>(i));
-        CUDA_CHECK(cudaMalloc(&dw.weight, n * sizeof(__half)));
-        CUDA_CHECK(cudaMemcpy(dw.weight, w.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
-        std::vector<__half> b(dw.out);
-        for (int i = 0; i < dw.out; ++i) b[i] = half_from_tv(b_tv, i);
-        CUDA_CHECK(cudaMalloc(&dw.bias, b.size() * sizeof(__half)));
-        CUDA_CHECK(cudaMemcpy(dw.bias, b.data(), b.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
-        // Check for INT8 scale
-        std::string scale_key = base + "_scale";
-        if (loader_.has(scale_key)) {
+        // Load weight: INT8 raw bytes or FP16 via half_from_tv
+        if (w_tv.dtype == DType::INT8) {
+            CUDA_CHECK(cudaMalloc(&dw.weight, n * sizeof(int8_t)));
+            CUDA_CHECK(cudaMemcpy(dw.weight, w_tv.data, n * sizeof(int8_t),
+                                  cudaMemcpyHostToDevice));
+            // Scale is mandatory for INT8 weights
+            std::string scale_key = w_key + "_scale";
+            if (!loader_.has(scale_key))
+                throw std::runtime_error("DACEngine: INT8 weight missing scale: " + scale_key);
             use_int8_ = true;
             auto s_tv = loader_.get(scale_key);
             CUDA_CHECK(cudaMalloc(&dw.scale, s_tv.nbytes()));
             CUDA_CHECK(cudaMemcpy(dw.scale, s_tv.data, s_tv.nbytes(), cudaMemcpyHostToDevice));
+        } else {
+            std::vector<__half> w(n);
+            for (size_t i = 0; i < n; ++i) w[i] = half_from_tv(w_tv, static_cast<int>(i));
+            CUDA_CHECK(cudaMalloc(&dw.weight, n * sizeof(__half)));
+            CUDA_CHECK(cudaMemcpy(dw.weight, w.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
         }
+
+        std::vector<__half> b(dw.out);
+        for (int i = 0; i < dw.out; ++i) b[i] = half_from_tv(b_tv, i);
+        CUDA_CHECK(cudaMalloc(&dw.bias, b.size() * sizeof(__half)));
+        CUDA_CHECK(cudaMemcpy(dw.bias, b.data(), b.size() * sizeof(__half), cudaMemcpyHostToDevice));
         dense_weights_[base] = dw;
     };
 
@@ -311,18 +319,23 @@ void DACEngine::load_decoder_weights() {
         dw.out = static_cast<int>(w_tv.shape[0]);
         dw.in = static_cast<int>(w_tv.shape[1]);
         size_t n = static_cast<size_t>(dw.out) * dw.in;
-        std::vector<__half> w(n);
-        for (size_t i = 0; i < n; ++i) w[i] = half_from_tv(w_tv, static_cast<int>(i));
-        CUDA_CHECK(cudaMalloc(&dw.weight, n * sizeof(__half)));
-        CUDA_CHECK(cudaMemcpy(dw.weight, w.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
 
-        // Check for INT8 scale
-        std::string scale_key = key + "_scale";
-        if (loader_.has(scale_key)) {
+        if (w_tv.dtype == DType::INT8) {
+            CUDA_CHECK(cudaMalloc(&dw.weight, n * sizeof(int8_t)));
+            CUDA_CHECK(cudaMemcpy(dw.weight, w_tv.data, n * sizeof(int8_t),
+                                  cudaMemcpyHostToDevice));
+            std::string scale_key = key + "_scale";
+            if (!loader_.has(scale_key))
+                throw std::runtime_error("DACEngine: INT8 weight missing scale: " + scale_key);
             use_int8_ = true;
             auto s_tv = loader_.get(scale_key);
             CUDA_CHECK(cudaMalloc(&dw.scale, s_tv.nbytes()));
             CUDA_CHECK(cudaMemcpy(dw.scale, s_tv.data, s_tv.nbytes(), cudaMemcpyHostToDevice));
+        } else {
+            std::vector<__half> w(n);
+            for (size_t i = 0; i < n; ++i) w[i] = half_from_tv(w_tv, static_cast<int>(i));
+            CUDA_CHECK(cudaMalloc(&dw.weight, n * sizeof(__half)));
+            CUDA_CHECK(cudaMemcpy(dw.weight, w.data(), n * sizeof(__half), cudaMemcpyHostToDevice));
         }
         dense_weights_[key] = dw;
     };

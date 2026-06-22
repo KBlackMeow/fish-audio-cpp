@@ -24,15 +24,25 @@ DTYPE_BF16 = 2
 DTYPE_INT8 = 3
 
 SKIP_PATTERNS = [
+    # Normalization & biases — small tensors, keep FP16
     "_norm.", "norm.", "norm_",
     ".bias", "bias.",
+    # Lookup tables (not GEMM)
     "codebook.weight",
     "codebook_embeddings",
+    "embeddings.weight",
+    # Convolutional weights (cuDNN doesn't support INT8)
+    ".conv.",
+    ".dwconv.",
+    # RoPE / activation / scale parameters
     "freqs_cis",
     "alpha",
     "gamma",
     "out_proj.bias",
     "in_proj.bias",
+    # RVQ projection weights (custom kernels, not cuBLAS GEMM)
+    "in_proj.weight",
+    "out_proj.weight",
 ]
 
 
