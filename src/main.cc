@@ -329,12 +329,23 @@ static std::string build_reference_prompt_file(
     return prompt_path;
 }
 
-// Resolve model file path with precision suffix fallback.
-// Priority: _int8 > _fp16 > _bf16 > unsuffixed (legacy).
+// Resolve model file path with precision suffix.
+// If dtype_override is non-empty, try only that suffix (e.g. "int8", "fp16").
+// Otherwise, auto-detect with priority: _int8 > _fp16 > _bf16 > unsuffixed.
 static std::string resolve_model_path(
     const std::string& model_dir,
-    const std::string& basename)
+    const std::string& basename,
+    const std::string& dtype_override = "")
 {
+    if (!dtype_override.empty()) {
+        std::string path = model_dir + "/" + basename + "_" + dtype_override + ".bin";
+        if (std::filesystem::exists(path)) {
+            spdlog::info("Resolved model: {}", path);
+            return path;
+        }
+        throw std::runtime_error(
+            "Requested dtype '" + dtype_override + "' but file not found: " + path);
+    }
     static const char* suffixes[] = {"_int8", "_fp16", "_bf16", ""};
     for (const char* suf : suffixes) {
         std::string path = model_dir + "/" + basename + suf + ".bin";
@@ -391,7 +402,9 @@ static int run_main(int argc, char* argv[]) {
          cxxopts::value<std::string>()->default_value("0.0.0.0"))
         ("port",            "Server port",
          cxxopts::value<int>()->default_value("8080"))
-        ("h,help",         "Print usage");
+        ("h,help",         "Print usage")
+        ("dtype",          "Precision override: fp16, int8 (default: auto-detect)",
+         cxxopts::value<std::string>()->default_value(""));
 
     auto args = opts.parse(argc, argv);
     if (args.count("help")) { spdlog::info("{}", opts.help()); return 0; }
@@ -415,11 +428,14 @@ static int run_main(int argc, char* argv[]) {
     const bool        server_mode  = args["server"].as<bool>();
     const std::string server_host  = args["host"].as<std::string>();
     const int         server_port  = args["port"].as<int>();
+    const std::string dtype_override = args["dtype"].as<std::string>();
 
     spdlog::info("=== Fish Audio S2 Pro TTS ===");
     spdlog::info("  model-dir : {}", model_dir);
     spdlog::info("  text      : '{}'", text);
     spdlog::info("  output    : {}", output_wav);
+    if (!dtype_override.empty())
+        spdlog::info("  dtype     : {}", dtype_override);
 
     if (!ref_codes.empty() && !prompt_file.empty())
         throw std::runtime_error("Use either --prompt-file or --ref-codes, not both");
@@ -469,7 +485,7 @@ static int run_main(int argc, char* argv[]) {
                  dual_ar_cfg.codebook_size, dual_ar_cfg.num_codebooks);
 
     fish::ModelLoader dual_ar_loader;
-    std::string dual_ar_path = resolve_model_path(model_dir, "dual_ar");
+    std::string dual_ar_path = resolve_model_path(model_dir, "dual_ar", dtype_override);
     if (!dual_ar_loader.load(dual_ar_path))
         throw std::runtime_error("Failed to load " + dual_ar_path);
     // pin_memory() registers 8 GB with CUDA which is very slow in WSL — skip it.
@@ -486,7 +502,7 @@ static int run_main(int argc, char* argv[]) {
     auto dac_cfg = fish::DACConfig::from_json(model_dir + "/dac_config.json");
 
     fish::ModelLoader dac_loader;
-    std::string dac_path = resolve_model_path(model_dir, "dac");
+    std::string dac_path = resolve_model_path(model_dir, "dac", dtype_override);
     if (!dac_loader.load(dac_path))
         throw std::runtime_error("Failed to load " + dac_path);
 

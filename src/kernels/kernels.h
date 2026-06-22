@@ -197,17 +197,19 @@ void f32_to_f16_cast(const float* src, __half* dst, int n, cudaStream_t stream =
 // Cast FP16 array to float32 (writes to dst)
 void f16_to_f32_cast(const __half* src, float* dst, int n, cudaStream_t stream = 0);
 
-// INT8 dequant + FP16 GEMM.
-// W:    [M, K] row-major int8_t weights
+// INT8 dequant + FP16 GEMM (cuBLAS INT8 Tensor Core path).
+// W:     [M, K] row-major int8_t weights
 // scale: [M] per-channel FP16 scale factors
-// X:    [N, K] row-major FP16 activation
-// Y:    [M, N] col-major FP16 output (ld=M — matches cuBLAS convention)
+// X:     [N, K] row-major FP16 activation
+// Y:     [M, N] col-major FP16 output (ld=M — matches cuBLAS convention)
+// cublas: cuBLAS handle (may be shared with caller's main handle)
 void int8_dequant_gemm_fp16(
     const int8_t* W,
     const __half* scale,
     const __half* X,
     __half* Y,
     int M, int N, int K,
+    cublasHandle_t cublas,
     cudaStream_t stream = 0);
 
 // GPU embedding lookup: indices → embeddings

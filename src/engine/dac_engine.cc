@@ -54,7 +54,7 @@ static void quantized_gemm_fp16(int M_out, int N_out, int K,
     if (scale != nullptr) {
         kernels::int8_dequant_gemm_fp16(
             reinterpret_cast<const int8_t*>(W), scale,
-            X, Y, M_out, N_out, K, stream);
+            X, Y, M_out, N_out, K, cublas, stream);
     } else {
         gemm_fp16(M_out, N_out, K, W, X, Y, cublas);
     }

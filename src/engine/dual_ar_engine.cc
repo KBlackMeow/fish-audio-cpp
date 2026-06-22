@@ -248,7 +248,7 @@ void DualAREngine::quantized_gemm(int M_out, int N_out, int K,
         // INT8 path: dequant + GEMM in one kernel
         kernels::int8_dequant_gemm_fp16(
             static_cast<const int8_t*>(weight.data),
-            it->second, X, Y, M_out, N_out, K, stream_);
+            it->second, X, Y, M_out, N_out, K, cublas_, stream_);
     } else {
         // FP16 path: standard cuBLAS GEMM
         gemm_fp16(M_out, N_out, K, weight.as<__half>(), X, Y, cublas_);
