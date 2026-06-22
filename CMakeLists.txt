@@ -85,6 +85,7 @@ add_library(fish_kernels STATIC
   src/kernels/rvq_lookup.cu
   src/kernels/ffn_activations.cu
   src/kernels/embedding.cu
+  src/kernels/int8_gemm.cu
   src/kernels/prefill_attention.cu
 )
 
