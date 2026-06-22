@@ -88,8 +88,9 @@ private:
 
     // INT8 quantization support
     bool use_int8_ = false;
-    // Maps GPU weight data pointer -> per-channel scale GPU pointer (null if FP16)
+    // Maps GPU weight data pointer -> (scale, smooth_inv) GPU pointers (null if FP16)
     std::unordered_map<void*, __half*> weight_to_scale_;
+    std::unordered_map<void*, __half*> weight_to_smooth_inv_;
     // Dispatch GEMM: FP16 cuBLAS or INT8 dequant+GEMM based on weight type
     void quantized_gemm(int M_out, int N_out, int K,
                         const TensorView& weight,

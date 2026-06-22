@@ -4,7 +4,10 @@
 #include "kernels/kernels.h"
 #include <spdlog/spdlog.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <filesystem>
 
 namespace fish {
 
@@ -96,7 +99,40 @@ DualAREngine::~DualAREngine() {
 // ============================================================================
 // init() — allocate workspace, RoPE freqs, fast KV cache, copy weights → GPU
 // ============================================================================
+// Calibration dump helper — dumps FP16 activations to disk when
+// FISH_CALIBRATE_DIR is set. Used for SmoothQuant activation calibration.
+// ============================================================================
+static std::string g_cal_dir;
+
+static void calibrate_dump(const char* tag, int layer, const __half* data,
+                            int n_tokens, int dim, cudaStream_t stream) {
+    if (g_cal_dir.empty()) return;
+    int64_t n = static_cast<int64_t>(n_tokens) * dim;
+    std::vector<__half> h(n);
+    cudaMemcpy(h.data(), data, n * sizeof(__half), cudaMemcpyDeviceToHost);
+    cudaStreamSynchronize(stream);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/L%02d_%s.bin", g_cal_dir.c_str(), layer, tag);
+    std::ofstream f(path, std::ios::binary);
+    // Header: int32 n_tokens, int32 dim, then raw FP16 data
+    int32_t hdr[2] = {static_cast<int32_t>(n_tokens),
+                       static_cast<int32_t>(dim)};
+    f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+    f.write(reinterpret_cast<const char*>(h.data()), n * sizeof(__half));
+}
+
+static void init_calibration_dir() {
+    const char* d = std::getenv("FISH_CALIBRATE_DIR");
+    if (d && *d) {
+        g_cal_dir = d;
+        std::filesystem::create_directories(g_cal_dir);
+        spdlog::info("Calibration: dumping activations to {}", g_cal_dir);
+    }
+}
+
 void DualAREngine::init() {
+    init_calibration_dir();
     int dim = cfg_.dim;
 
     // Text model RoPE frequencies — per head_dim (kernel reads freqs[pair % (head_dim/2)])
@@ -189,6 +225,17 @@ void DualAREngine::init() {
                                   cudaMemcpyHostToDevice));
         }
         weight_to_scale_[gp] = scale_gp;
+
+        // Look up calibration smooth_inv
+        std::string smooth_name = nw.name + "_smooth_inv";
+        __half* smooth_gp = nullptr;
+        if (loader_.has(smooth_name)) {
+            auto smooth_tv = loader_.get(smooth_name);
+            CUDA_CHECK(cudaMalloc(&smooth_gp, smooth_tv.nbytes()));
+            CUDA_CHECK(cudaMemcpy(smooth_gp, smooth_tv.data, smooth_tv.nbytes(),
+                                  cudaMemcpyHostToDevice));
+        }
+        weight_to_smooth_inv_[gp] = smooth_gp;
         tv->data = gp;
         tg += nb;
     }
@@ -245,17 +292,20 @@ void DualAREngine::quantized_gemm(int M_out, int N_out, int K,
                                    const __half* X, __half* Y) {
     auto it = weight_to_scale_.find(weight.data);
     if (it != weight_to_scale_.end() && it->second != nullptr) {
-        // INT8 path: dequant + GEMM in one kernel
+        // INT8 path: dequant + GEMM (with optional calibration smooth)
+        __half* smooth_inv = nullptr;
+        auto sit = weight_to_smooth_inv_.find(weight.data);
+        if (sit != weight_to_smooth_inv_.end()) smooth_inv = sit->second;
         kernels::int8_dequant_gemm_fp16(
             static_cast<const int8_t*>(weight.data),
-            it->second, X, Y, M_out, N_out, K, cublas_, stream_);
+            it->second, smooth_inv, X, Y, M_out, N_out, K, cublas_, stream_);
     } else {
         // FP16 path: standard cuBLAS GEMM
         gemm_fp16(M_out, N_out, K, weight.as<__half>(), X, Y, cublas_);
     }
 }
 
-// ============================================================================
+
 // prefill — process the full prompt through the text transformer
 //
 // QKV split: GPU-side qkv_split_heads_gqa transforms to head-major in one kernel.
@@ -359,6 +409,7 @@ void DualAREngine::prefill(const int32_t* tokens, int B, int T, int prompt_strid
         // RMSNorm → fused QKV
         kernels::rms_norm(curr, lw.attn_norm.as<__half>(), ws1_,
                           n_tokens, dim, cfg_.norm_eps, stream_);
+        calibrate_dump("attn", l, ws1_, n_tokens, dim, stream_);
 
         quantized_gemm(qkv_dim, n_tokens, dim, lw.wqkv, ws1_, ws2_);
 
@@ -423,6 +474,7 @@ void DualAREngine::prefill(const int32_t* tokens, int B, int T, int prompt_strid
         // --- SwiGLU FFN ---
         int inter = cfg_.intermediate_size;
         kernels::rms_norm(curr, lw.ffn_norm.as<__half>(), ws2_, n_tokens, dim, cfg_.norm_eps, stream_);
+        calibrate_dump("ffn", l, ws2_, n_tokens, dim, stream_);
 
         // gate = silu(X @ w_gate^T)
         quantized_gemm(inter, n_tokens, dim, lw.w_gate, ws2_, ws1_);
@@ -491,6 +543,7 @@ void DualAREngine::decode_step(const __half* input_embed, int B, int token_pos,
         // RMSNorm → fused QKV projection
         kernels::rms_norm(curr, lw.attn_norm.as<__half>(), ws1_,
                           B, dim, cfg_.norm_eps, stream_);
+        calibrate_dump("attn", l, ws1_, B, dim, stream_);
         quantized_gemm(qkv_dim, B, dim, lw.wqkv, ws1_, ws2_);
 
         // Split Q, K, V (B=1, so flat layout = head-major layout)
@@ -546,6 +599,7 @@ void DualAREngine::decode_step(const __half* input_embed, int B, int token_pos,
         int inter = cfg_.intermediate_size;
         kernels::rms_norm(curr, lw.ffn_norm.as<__half>(), ws2_,
                           B, dim, cfg_.norm_eps, stream_);
+        calibrate_dump("ffn", l, ws2_, B, dim, stream_);
 
         quantized_gemm(inter, B, dim, lw.w_gate, ws2_, ws1_);
         kernels::silu_forward(ws1_, B * inter, stream_);
@@ -671,6 +725,7 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
         // RMSNorm → fused QKV
         kernels::rms_norm(curr, fl.attn_norm.as<__half>(), ws1_,
                           B, dim, cfg_.norm_eps, stream_);
+        calibrate_dump("fast_attn", l, ws1_, B, dim, stream_);
         quantized_gemm(fqkv_dim, B, dim, fl.wqkv, ws1_, ws2_);
 
         // Split Q, K, V (B=1)
@@ -711,6 +766,7 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
         // --- SwiGLU FFN ---
         kernels::rms_norm(curr, fl.ffn_norm.as<__half>(), ws2_,
                           B, dim, cfg_.norm_eps, stream_);
+        calibrate_dump("fast_ffn", l, ws2_, B, dim, stream_);
 
         int fi = cfg_.fast_intermediate_size;
         quantized_gemm(fi, B, dim, fl.w_gate, ws2_, ws1_);

@@ -49,11 +49,12 @@ void gemm_fp16_to_f32(int M_out, int N_out, int K,
 // Dispatch GEMM: INT8 dequant+GEMM if scale is provided, else FP16 cuBLAS.
 static void quantized_gemm_fp16(int M_out, int N_out, int K,
                                  const __half* W, const __half* scale,
+                                 const __half* smooth_inv,
                                  const __half* X, __half* Y,
                                  cublasHandle_t cublas, cudaStream_t stream) {
     if (scale != nullptr) {
         kernels::int8_dequant_gemm_fp16(
-            reinterpret_cast<const int8_t*>(W), scale,
+            reinterpret_cast<const int8_t*>(W), scale, smooth_inv,
             X, Y, M_out, N_out, K, cublas, stream);
     } else {
         gemm_fp16(M_out, N_out, K, W, X, Y, cublas);
@@ -678,7 +679,7 @@ int DACEngine::decode_waveform_native(int batch_size, int code_len, float* audio
         const auto& dw = dense_weights_.at(key);
         int N = B * L;
         kernels::transpose_fp16(src, decoder_buf_d_, Cin, N, L, Cin, stream_);
-        quantized_gemm_fp16(dw.out, N, dw.in, dw.weight, dw.scale,
+        quantized_gemm_fp16(dw.out, N, dw.in, dw.weight, dw.scale, dw.smooth_inv,
                             decoder_buf_d_, decoder_buf_c_, cublas_, stream_);
         kernels::transpose_fp16(decoder_buf_c_, dst, N, dw.out, dw.out, L, stream_);
         kernels::add_channel_bias(dst, dw.bias, B, dw.out, L, stream_);
@@ -709,7 +710,7 @@ int DACEngine::decode_waveform_native(int batch_size, int code_len, float* audio
     auto dense_nobias = [&](const std::string& key, const __half* src, __half* dst,
                             int rows, int in_dim) {
         const auto& dw = dense_weights_.at(key);
-        quantized_gemm_fp16(dw.out, rows, in_dim, dw.weight, dw.scale, src, dst, cublas_, stream_);
+        quantized_gemm_fp16(dw.out, rows, in_dim, dw.weight, dw.scale, dw.smooth_inv, src, dst, cublas_, stream_);
         return dw.out;
     };
 
@@ -971,7 +972,7 @@ int DACEngine::encode_waveform_native(const float* audio, int batch_size, int au
     auto dense_nobias = [&](const std::string& key, const __half* src, __half* dst,
                             int rows, int in_dim) {
         const auto& dw = dense_weights_.at(key);
-        quantized_gemm_fp16(dw.out, rows, in_dim, dw.weight, dw.scale, src, dst, cublas_, stream_);
+        quantized_gemm_fp16(dw.out, rows, in_dim, dw.weight, dw.scale, dw.smooth_inv, src, dst, cublas_, stream_);
         return dw.out;
     };
 
@@ -1010,7 +1011,7 @@ int DACEngine::encode_waveform_native(const float* audio, int batch_size, int au
         const auto& dw = dense_weights_.at(key);
         int N = Bc * Lc;
         kernels::transpose_fp16(src, decoder_buf_d_, Cin, N, Lc, Cin, stream_);
-        quantized_gemm_fp16(dw.out, N, dw.in, dw.weight, dw.scale,
+        quantized_gemm_fp16(dw.out, N, dw.in, dw.weight, dw.scale, dw.smooth_inv,
                             decoder_buf_d_, decoder_buf_c_, cublas_, stream_);
         kernels::transpose_fp16(decoder_buf_c_, dst, N, dw.out, dw.out, Lc, stream_);
         kernels::add_channel_bias(dst, dw.bias, Bc, dw.out, Lc, stream_);
@@ -1266,7 +1267,7 @@ int DACEngine::encode_waveform_native(const float* audio, int batch_size, int au
                 const auto& dw = dense_weights_.at(pp + ".feed_forward.w2.weight");
                 if (dw.scale != nullptr) {
                     // INT8 path: compute FP16 result, then cast to FP32
-                    quantized_gemm_fp16(dw.out, T, I, dw.weight, dw.scale,
+                    quantized_gemm_fp16(dw.out, T, I, dw.weight, dw.scale, dw.smooth_inv,
                                         qkv, decoder_buf_c_, cublas_, stream_);
                     kernels::f16_to_f32_cast(decoder_buf_c_, ffn_out_f32,
                                              T * dw.out, stream_);

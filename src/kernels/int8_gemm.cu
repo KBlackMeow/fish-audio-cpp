@@ -1,15 +1,11 @@
 // src/kernels/int8_gemm.cu
 // INT8 weight-only dequant + cuBLAS FP16 GEMM.
 //
-// Strategy: dequantize INT8 weights to FP16 in a fast kernel, then
-// use standard cuBLAS FP16 GEMM. This preserves INT8 memory savings
-// (~50% weight VRAM) while retaining full cuBLAS FP16 performance
-// and numerical accuracy (no activation quantization noise).
+// Dequant: W_fp16[m,k] = W_int8[m,k] * scale[m] * smooth_inv[k]
+// (smooth_inv is optional — nullptr means no calibration smoothing)
+// Then standard cuBLAS FP16 GEMM (Tensor Cores).
 //
-//   W_int8: [M, K] row-major int8_t
-//   scale:  [M] per-channel FP16
-//   X:      [N, K] row-major FP16
-//   Y:      [M, N] col-major FP16 (cuBLAS convention, ld=M)
+// Cached: each unique INT8 weight ptr is dequantized exactly once.
 
 #include "kernels/kernels.h"
 #include <cuda_fp16.h>
@@ -20,10 +16,10 @@
 namespace fish::kernels {
 namespace {
 
-// Dequantize INT8 weights → FP16: W_fp16[m,k] = W_int8[m,k] * scale[m]
 __global__ void dequant_weights_kernel(
     const int8_t* __restrict__ W_int8,
     const __half* __restrict__ scale,
+    const __half* __restrict__ smooth_inv,  // [K] or nullptr
     __half* __restrict__ W_fp16,
     int M, int K)
 {
@@ -32,49 +28,58 @@ __global__ void dequant_weights_kernel(
     float s = __half2float(scale[row]);
     const int8_t* src = W_int8 + static_cast<size_t>(row) * K;
     __half* dst = W_fp16 + static_cast<size_t>(row) * K;
-    for (int k = threadIdx.x; k < K; k += blockDim.x) {
-        dst[k] = __float2half(static_cast<float>(src[k]) * s);
+
+    if (smooth_inv) {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            float si = __half2float(smooth_inv[k]);
+            dst[k] = __float2half(static_cast<float>(src[k]) * s * si);
+        }
+    } else {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            dst[k] = __float2half(static_cast<float>(src[k]) * s);
+        }
     }
 }
+
+// Cache key combines INT8 pointer and smooth_inv pointer
+struct CacheKey {
+    const int8_t* w;
+    const __half* si;
+    bool operator==(const CacheKey& o) const { return w == o.w && si == o.si; }
+};
+struct CacheKeyHash {
+    size_t operator()(const CacheKey& k) const {
+        return reinterpret_cast<size_t>(k.w) ^
+               (reinterpret_cast<size_t>(k.si) << 1);
+    }
+};
 
 }  // namespace
 
 void int8_dequant_gemm_fp16(
     const int8_t* W,
     const __half* scale,
+    const __half* smooth_inv,
     const __half* X,
     __half* Y,
     int M, int N, int K,
     cublasHandle_t cublas,
     cudaStream_t stream)
 {
-    // Cache: each unique INT8 weight ptr → its own dedicated FP16 buffer.
-    // Each weight matrix is dequantized exactly once.
-    static std::unordered_map<const int8_t*, __half*> cache;
-    static std::unordered_map<const int8_t*, size_t> cap_map;
+    static std::unordered_map<CacheKey, __half*, CacheKeyHash> cache;
 
+    CacheKey key{W, smooth_inv};
     __half* w_fp16 = nullptr;
-    auto it = cache.find(W);
+    auto it = cache.find(key);
     if (it != cache.end()) {
         w_fp16 = it->second;
     } else {
-        size_t need = static_cast<size_t>(M) * K;
-        // Check if we already have a buffer of at least this size
-        auto cit = cap_map.find(W);
-        if (cit == cap_map.end() || cit->second < need) {
-            __half* buf = nullptr;
-            cudaMalloc(&buf, need * sizeof(__half));
-            cache[W] = buf;
-            cap_map[W] = need;
-            w_fp16 = buf;
-        } else {
-            w_fp16 = cache[W];
-        }
+        cudaMalloc(&w_fp16, static_cast<size_t>(M) * K * sizeof(__half));
         dequant_weights_kernel<<<M, 256, 0, stream>>>(
-            W, scale, w_fp16, M, K);
+            W, scale, smooth_inv, w_fp16, M, K);
+        cache[key] = w_fp16;
     }
 
-    // Standard cuBLAS FP16 GEMM (Tensor Cores)
     float alpha = 1.0f, beta = 0.0f;
     cublasGemmEx(cublas,
         CUBLAS_OP_T, CUBLAS_OP_N,

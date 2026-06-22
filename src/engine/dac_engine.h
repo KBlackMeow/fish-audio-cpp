@@ -94,7 +94,8 @@ private:
     struct DenseWeight {
         __half* weight = nullptr;
         __half* bias = nullptr;
-        __half* scale = nullptr;   // INT8 per-channel scale (null if FP16)
+        __half* scale = nullptr;      // INT8 per-channel scale (null if FP16)
+        __half* smooth_inv = nullptr; // calibration smooth factor (null if none)
         int out = 0;
         int in = 0;
     };
