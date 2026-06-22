@@ -25,8 +25,8 @@ require_file() {
 }
 
 require_file "$ROOT_DIR/CMakeLists.txt"
-require_file "$MODEL_DIR/dual_ar.bin"
-require_file "$MODEL_DIR/dac.bin"
+require_file "$MODEL_DIR/dual_ar_fp16.bin"
+require_file "$MODEL_DIR/dac_fp16.bin"
 require_file "$MODEL_DIR/dual_ar_config.json"
 require_file "$MODEL_DIR/dac_config.json"
 require_file "$MODEL_DIR/tokenizer.json"
