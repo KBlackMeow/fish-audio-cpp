@@ -324,7 +324,6 @@ void DualAREngine::prefill(const int32_t* tokens, int B, int T, int prompt_strid
 
         // RoPE on Q and K (head-major layout)
         kernels::rope_qk(q_buf_, k_buf_, rope_freqs_, B, n_q, n_kv, T, D, 0, stream_);
-        CUDA_CHECK(cudaStreamSynchronize(stream_));
 
         // Write K/V to paged cache
         if (k_cache && v_cache) {
@@ -587,18 +586,18 @@ void DualAREngine::embed_for_decode(int32_t semantic_token, const int32_t* codeb
 // The fast decoder has 4 transformer layers with its own KV cache.
 // Q, K, V are projected from the input hidden state, RoPE applied,
 // K/V written to fast_k_cache_/fast_v_cache_ at position codebook_step,
-// then CPU attention runs over all T_kv = codebook_step + 1 positions.
+// then attention runs over all T_kv = codebook_step + 1 positions.
 // ============================================================================
 void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
                                         __half* codebook_hidden, __half* logits,
-                                        int B, int codebook_step, int32_t prev_token)
+                                        int B, int codebook_step, int32_t prev_token,
+                                        bool compute_logits)
 {
     int dim = cfg_.fast_dim, fq = cfg_.fast_n_head, fkv = cfg_.fast_n_local_heads;
     int fD = cfg_.fast_head_dim, cb = cfg_.codebook_size;
     int fqkv_dim = (fq + 2 * fkv) * fD;
     int T_kv = codebook_step + 1;  // number of K/V positions available
     float sm_scale = 1.0f / std::sqrt(float(fD));
-    int gs = fq / fkv;
 
     // Choose input: slow hidden state for step 0, fast embedding for step > 0
     if (codebook_step == 0) {
@@ -638,7 +637,6 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
 
         // Write K/V to fast decoder cache at position codebook_step
         // Cache layout: [n_fast_layer, n_kv_heads, num_codebooks, head_dim]
-        CUDA_CHECK(cudaStreamSynchronize(stream_));
         for (int h = 0; h < fkv; h++) {
             size_t off = (((size_t)l * fkv + h) * cfg_.num_codebooks + codebook_step) * fD;
             CUDA_CHECK(cudaMemcpyAsync(fast_k_cache_ + off, k_buf_ + h * fD,
@@ -647,54 +645,12 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
                                        fD * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
         }
 
-        // CPU attention: Q [fq, fD] × K/V [fkv, T_kv, fD]
-        std::vector<__half> hq(q_elems), hk_all(fkv * T_kv * fD), hv_all(fkv * T_kv * fD);
-        CUDA_CHECK(cudaMemcpy(hq.data(), q_buf_, q_elems * sizeof(__half), cudaMemcpyDeviceToHost));
-
-        // Read K/V from fast cache (T_kv positions per head)
-        for (int h = 0; h < fkv; h++) {
-            size_t src_off = (((size_t)l * fkv + h) * cfg_.num_codebooks) * fD;
-            size_t dst_off = (size_t)h * T_kv * fD;
-            CUDA_CHECK(cudaMemcpy(hk_all.data() + dst_off,
-                                  fast_k_cache_ + src_off,
-                                  T_kv * fD * sizeof(__half), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(hv_all.data() + dst_off,
-                                  fast_v_cache_ + src_off,
-                                  T_kv * fD * sizeof(__half), cudaMemcpyDeviceToHost));
-        }
-
-        // Attention: O_h = softmax(Q_h × K_kh^T / sqrt(D)) × V_kh
-        std::vector<__half> ho(q_elems, __float2half(0.0f));
-        for (int h = 0; h < fq; h++) {
-            int kh = h / gs;
-            const __half* Qh = hq.data() + h * fD;
-            const __half* Kk = hk_all.data() + kh * T_kv * fD;
-            const __half* Vk = hv_all.data() + kh * T_kv * fD;
-
-            // Scores: Qh [fD] × Kk^T [fD, T_kv] → [T_kv]
-            std::vector<float> s(T_kv);
-            float mx = -1e30f;
-            for (int t = 0; t < T_kv; t++) {
-                float d = 0;
-                for (int k = 0; k < fD; k++)
-                    d += __half2float(Qh[k]) * __half2float(Kk[t * fD + k]);
-                s[t] = d * sm_scale;
-                mx = std::max(mx, s[t]);
-            }
-            float sm = 0;
-            for (int t = 0; t < T_kv; t++) { s[t] = std::exp(s[t] - mx); sm += s[t]; }
-            for (int t = 0; t < T_kv; t++) s[t] /= sm;
-
-            // O_h = s @ Vk [T_kv, fD] → [fD]
-            __half* Oh = ho.data() + h * fD;
-            for (int k = 0; k < fD; k++) {
-                float v = 0;
-                for (int t = 0; t < T_kv; t++)
-                    v += s[t] * __half2float(Vk[t * fD + k]);
-                Oh[k] = __float2half(v);
-            }
-        }
-        CUDA_CHECK(cudaMemcpy(attn_out_buf_, ho.data(), q_elems * sizeof(__half), cudaMemcpyHostToDevice));
+        const size_t layer_cache_off =
+            static_cast<size_t>(l) * fkv * cfg_.num_codebooks * fD;
+        kernels::fast_attention_decode(
+            q_buf_, fast_k_cache_ + layer_cache_off, fast_v_cache_ + layer_cache_off,
+            attn_out_buf_, B, fq, fkv, fD, T_kv, cfg_.num_codebooks,
+            sm_scale, stream_);
 
         // Wo projection + residual
         gemm_fp16(dim, B, fq * fD, fl.wo.as<__half>(), attn_out_buf_, ws1_, cublas_);
@@ -715,14 +671,17 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
         kernels::residual_add(curr, ws2_, B * dim, stream_);
     }
 
-    // Final RMSNorm → logits
-    kernels::rms_norm(curr, w_fast_norm_.as<__half>(), ws1_,
-                      B, dim, cfg_.norm_eps, stream_);
-    gemm_fp16(cb, B, dim, w_fast_output_.as<__half>(), ws1_, logits, cublas_);
+    if (compute_logits) {
+        kernels::rms_norm(curr, w_fast_norm_.as<__half>(), ws1_,
+                          B, dim, cfg_.norm_eps, stream_);
+        gemm_fp16(cb, B, dim, w_fast_output_.as<__half>(), ws1_, logits, cublas_);
+    }
 
     // Copy pre-norm hidden → codebook_hidden for next step's input
-    CUDA_CHECK(cudaMemcpyAsync(codebook_hidden, curr, B * dim * sizeof(__half),
-                               cudaMemcpyDeviceToDevice, stream_));
+    if (codebook_hidden) {
+        CUDA_CHECK(cudaMemcpyAsync(codebook_hidden, curr, B * dim * sizeof(__half),
+                                   cudaMemcpyDeviceToDevice, stream_));
+    }
 }
 
 }  // namespace fish

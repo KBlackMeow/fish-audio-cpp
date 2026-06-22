@@ -69,7 +69,7 @@ public:
     // prev_token  : token sampled at codebook_step-1 (ignored when step == 0)
     void fast_codebook_decode(const __half* fast_hidden, __half* codebook_hidden,
                               __half* logits, int batch_size, int codebook_step,
-                              int32_t prev_token = 0);
+                              int32_t prev_token = 0, bool compute_logits = true);
 
 private:
     void text_attention_prefill(const __half* input, __half* output,

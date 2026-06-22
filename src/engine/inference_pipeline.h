@@ -6,13 +6,37 @@
 #include "tokenizer/tokenizer.h"
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace fish {
 
+struct TTSProfiling {
+    double total_ms = 0.0;
+    double tokenize_ms = 0.0;
+    double prefill_ms = 0.0;
+    double ar_decode_ms = 0.0;
+    double dac_decode_ms = 0.0;
+    double audio_copy_ms = 0.0;
+    double first_audio_ms = 0.0;
+    double ref_decode_ms = 0.0;
+    double ref_encode_ms = 0.0;
+    double prompt_build_ms = 0.0;
+    double response_encode_ms = 0.0;
+    int prompt_tokens = 0;
+    int generated_frames = 0;
+    int ref_code_frames = 0;
+    int streamed_dac_calls = 0;
+    int streamed_audio_chunks = 0;
+    bool ref_cache_hit = false;
+};
+
 struct TTSOutput {
     std::vector<float> audio_samples;  // PCM float32, mono
+    std::vector<int32_t> generated_codes;  // [num_codebooks, generated_frames]
     int sample_rate = 0;
+    TTSProfiling profiling;
 };
 
 // Callbacks for streaming inference.
@@ -82,7 +106,9 @@ public:
         const float* ref_audio, int ref_num_samples,
         const std::string& ref_text,
         const std::string& target_text,
-        int max_new_tokens, float temperature, float top_p, int top_k, int seed
+        int max_new_tokens, float temperature, float top_p, int top_k, int seed,
+        int chunk_length = 0,
+        int history_frames = 96
     );
 
     // Streaming variant of run_with_ref_audio().
@@ -91,6 +117,8 @@ public:
         const std::string& ref_text,
         const std::string& target_text,
         int max_new_tokens, float temperature, float top_p, int top_k, int seed,
+        int chunk_length,
+        int history_frames,
         StreamCallback callback
     );
 
@@ -98,15 +126,32 @@ public:
     int sample_rate() const;
 
 private:
-    // Build an in-memory prompt tensor for voice cloning. Writes temp .bin file, returns path.
-    std::string build_ref_prompt_file(
+    std::vector<int32_t> build_ref_prompt(
         const int32_t* codes, int num_codebooks, int code_len,
-        const std::string& ref_text, const std::string& target_text
+        const std::string& ref_text, const std::string& target_text,
+        int* prompt_len_out = nullptr
     );
+    TTSOutput run_with_prompt_tensor(
+        const std::vector<int32_t>& prompt,
+        int num_codebooks,
+        int prompt_len,
+        int max_new_tokens,
+        float temperature,
+        float top_p,
+        int top_k,
+        int seed,
+        StreamCallback callback = {}
+    );
+    struct RefCodeCacheEntry {
+        std::vector<int32_t> codes;
+        int code_len = 0;
+    };
     std::unique_ptr<DualAREngine> dual_ar_;
     std::unique_ptr<DACEngine> dac_;
     std::unique_ptr<BlockManager> block_mgr_;
     std::unique_ptr<Tokenizer> tokenizer_;
+    std::mutex ref_code_cache_mutex_;
+    std::unordered_map<std::size_t, RefCodeCacheEntry> ref_code_cache_;
 };
 
 }  // namespace fish

@@ -130,6 +130,37 @@ void sample_top_k_top_p(
     cudaStream_t stream = 0
 );
 
+// Sample from logits[:, id_start:id_start+vocab_size] and return absolute token ids.
+void sample_top_k_top_p_range(
+    const __half* logits,     // [B, total_vocab_size]
+    int32_t* out_tokens,      // [B]
+    int batch_size,
+    int total_vocab_size,
+    int id_start,
+    int vocab_size,
+    float temperature,
+    float top_p,
+    int top_k,
+    uint64_t seed,
+    cudaStream_t stream = 0
+);
+
+// Sample from semantic range plus a separate eos logit and return absolute token ids.
+void sample_top_k_top_p_semantic_eos(
+    const __half* logits,     // [B, total_vocab_size]
+    int32_t* out_tokens,      // [B]
+    int batch_size,
+    int total_vocab_size,
+    int semantic_start,
+    int semantic_size,
+    int eos_id,
+    float temperature,
+    float top_p,
+    int top_k,
+    uint64_t seed,
+    cudaStream_t stream = 0
+);
+
 // RVQ codebook lookup and sum
 void rvq_lookup_decode(
     const int32_t* codes,          // [B, num_codebooks, T]

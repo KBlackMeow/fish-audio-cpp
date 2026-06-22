@@ -1351,7 +1351,6 @@ void DACEngine::encode(const float* audio, int batch_size, int audio_len,
                 gpu_codebooks_[cb], gpu_out_proj_w_[cb], gpu_out_proj_b_[cb],
                 cb_d, r_out,
                 B, T_code, cb_size, DAC_CODEBOOK_DIM, DAC_LATENT_DIM, stream_);
-            CUDA_CHECK(cudaStreamSynchronize(stream_));
         }
 
         CUDA_CHECK(cudaMemcpy(codes, d_codes, cb_bytes, cudaMemcpyDeviceToHost));
