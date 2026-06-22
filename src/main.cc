@@ -329,17 +329,15 @@ static std::string build_reference_prompt_file(
     return prompt_path;
 }
 
-// Resolve model file path.  Directory layout (new convention):
-//   model_dir/
-//     dual_ar-fp16/model.bin          dual_ar-int8-w8a16/model.bin
-//     dac-fp16/model.bin              dac-int8-w8a16/model.bin
-//   Legacy flat layout also supported:
-//     model_dir/dual_ar_fp16.bin      model_dir/dual_ar_int8-w8a16.bin
+// Resolve model file path.  Directory layout:
+//   model_dir/models/model-fp16/dual_ar.bin    (new: recommended)
+//   model_dir/models/model-int8-w8a16/dac.bin
+//   model_dir/dual_ar_fp16.bin                 (legacy: flat, still works)
 // --dtype maps shorthand: int8 → int8-w8a16
-// Auto-detect priority: _int8-w8a16 > _fp16 > _bf16 > unsuffixed (legacy).
+// Auto-detect priority: int8-w8a16 > fp16 > bf16 > unsuffixed (legacy).
 static std::string resolve_model_path(
     const std::string& model_dir,
-    const std::string& basename,
+    const std::string& basename,   // "dual_ar" or "dac"
     const std::string& dtype_override = "")
 {
     auto suffix_for = [](const std::string& dt) -> std::string {
@@ -347,7 +345,6 @@ static std::string resolve_model_path(
         return dt;
     };
 
-    // Try a list of candidate paths, return the first that exists
     auto try_resolve = [&](const std::vector<std::string>& candidates) -> std::string {
         for (const auto& p : candidates) {
             if (std::filesystem::exists(p)) {
@@ -358,11 +355,10 @@ static std::string resolve_model_path(
         return "";
     };
 
-    // Ordered candidates: subdir first, then flat legacy, then bare
     auto candidates = [&](const std::string& suffix) -> std::vector<std::string> {
         return {
-            model_dir + "/" + basename + "-" + suffix + "/model.bin",   // new: subdir
-            model_dir + "/" + basename + "_" + suffix + ".bin",         // legacy: flat
+            model_dir + "/models/model-" + suffix + "/" + basename + ".bin",  // new
+            model_dir + "/" + basename + "_" + suffix + ".bin",               // legacy
         };
     };
 
