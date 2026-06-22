@@ -355,10 +355,15 @@ static std::string resolve_model_path(
         return "";
     };
 
+    auto dir = std::filesystem::path(model_dir);
+    // Search models/ at project root, then parent, then model_dir, then legacy flat
     auto candidates = [&](const std::string& suffix) -> std::vector<std::string> {
+        auto sub = "/models/model-" + suffix + "/" + basename + ".bin";
         return {
-            model_dir + "/models/model-" + suffix + "/" + basename + ".bin",  // new
-            model_dir + "/" + basename + "_" + suffix + ".bin",               // legacy
+            dir.parent_path().parent_path().string() + sub,  // ../../models/ (project root)
+            dir.parent_path().string() + sub,                // ../models/
+            model_dir + sub,                                  // models/ inside model_dir
+            model_dir + "/" + basename + "_" + suffix + ".bin",  // legacy flat
         };
     };
 
