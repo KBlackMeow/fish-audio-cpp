@@ -329,37 +329,55 @@ static std::string build_reference_prompt_file(
     return prompt_path;
 }
 
-// Resolve model file path with precision suffix.
-// --dtype maps shorthand to file suffix: int8 → int8-w8a16, fp16 → fp16, etc.
+// Resolve model file path.  Directory layout (new convention):
+//   model_dir/
+//     dual_ar-fp16/model.bin          dual_ar-int8-w8a16/model.bin
+//     dac-fp16/model.bin              dac-int8-w8a16/model.bin
+//   Legacy flat layout also supported:
+//     model_dir/dual_ar_fp16.bin      model_dir/dual_ar_int8-w8a16.bin
+// --dtype maps shorthand: int8 → int8-w8a16
 // Auto-detect priority: _int8-w8a16 > _fp16 > _bf16 > unsuffixed (legacy).
 static std::string resolve_model_path(
     const std::string& model_dir,
     const std::string& basename,
     const std::string& dtype_override = "")
 {
-    // Map shorthand dtype to file suffix
     auto suffix_for = [](const std::string& dt) -> std::string {
         if (dt == "int8") return "int8-w8a16";
-        return dt;  // fp16, bf16, etc.
+        return dt;
+    };
+
+    // Try a list of candidate paths, return the first that exists
+    auto try_resolve = [&](const std::vector<std::string>& candidates) -> std::string {
+        for (const auto& p : candidates) {
+            if (std::filesystem::exists(p)) {
+                spdlog::info("Resolved model: {}", p);
+                return p;
+            }
+        }
+        return "";
+    };
+
+    // Ordered candidates: subdir first, then flat legacy, then bare
+    auto candidates = [&](const std::string& suffix) -> std::vector<std::string> {
+        return {
+            model_dir + "/" + basename + "-" + suffix + "/model.bin",   // new: subdir
+            model_dir + "/" + basename + "_" + suffix + ".bin",         // legacy: flat
+        };
     };
 
     if (!dtype_override.empty()) {
         auto suf = suffix_for(dtype_override);
-        std::string path = model_dir + "/" + basename + "_" + suf + ".bin";
-        if (std::filesystem::exists(path)) {
-            spdlog::info("Resolved model: {}", path);
-            return path;
-        }
+        auto path = try_resolve(candidates(suf));
+        if (!path.empty()) return path;
         throw std::runtime_error(
-            "Requested dtype '" + dtype_override + "' but file not found: " + path);
+            "Requested dtype '" + dtype_override + "', not found in " + model_dir);
     }
-    static const char* suffixes[] = {"_int8-w8a16", "_fp16", "_bf16", ""};
+
+    static const char* suffixes[] = {"int8-w8a16", "fp16", "bf16", ""};
     for (const char* suf : suffixes) {
-        std::string path = model_dir + "/" + basename + suf + ".bin";
-        if (std::filesystem::exists(path)) {
-            spdlog::info("Resolved model: {}", path);
-            return path;
-        }
+        auto path = try_resolve(candidates(suf));
+        if (!path.empty()) return path;
     }
     return model_dir + "/" + basename + "_fp16.bin";
 }
