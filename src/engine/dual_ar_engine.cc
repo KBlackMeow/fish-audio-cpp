@@ -132,34 +132,68 @@ void DualAREngine::init() {
     CUBLAS_CHECK(cublasSetWorkspace(cublas_, cublas_ws_, cublas_ws_size_));
     CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
 
-    // Copy all weights to GPU
-    std::vector<TensorView*> wv = {
-        &w_embedding_, &w_text_norm_,
-        &w_fast_embeddings_, &w_codebook_embeddings_,
-        &w_fast_norm_, &w_fast_output_
-    };
-    for (auto& lw : layers_) {
-        wv.push_back(&lw.wqkv); wv.push_back(&lw.wo);
-        wv.push_back(&lw.q_norm); wv.push_back(&lw.k_norm);
-        wv.push_back(&lw.attn_norm); wv.push_back(&lw.ffn_norm);
-        wv.push_back(&lw.w_gate); wv.push_back(&lw.w_up); wv.push_back(&lw.w_down);
+    // Copy all weights to GPU (FP16 or INT8 with per-channel scales)
+    struct NamedTV { std::string name; TensorView* tv; };
+    std::vector<NamedTV> named_weights;
+
+    named_weights.push_back({"text_model.model.embeddings.weight", &w_embedding_});
+    named_weights.push_back({"text_model.model.norm.weight", &w_text_norm_});
+    named_weights.push_back({"audio_decoder.embeddings.weight", &w_fast_embeddings_});
+    named_weights.push_back({"audio_decoder.codebook_embeddings.weight", &w_codebook_embeddings_});
+    named_weights.push_back({"audio_decoder.norm.weight", &w_fast_norm_});
+    named_weights.push_back({"audio_decoder.output.weight", &w_fast_output_});
+
+    for (int l = 0; l < cfg_.n_layer; l++) {
+        auto p = "text_model.model.layers." + std::to_string(l) + ".";
+        auto& lw = layers_[l];
+        named_weights.push_back({p + "attention.wqkv.weight", &lw.wqkv});
+        named_weights.push_back({p + "attention.wo.weight", &lw.wo});
+        named_weights.push_back({p + "attention.q_norm.weight", &lw.q_norm});
+        named_weights.push_back({p + "attention.k_norm.weight", &lw.k_norm});
+        named_weights.push_back({p + "attention_norm.weight", &lw.attn_norm});
+        named_weights.push_back({p + "ffn_norm.weight", &lw.ffn_norm});
+        named_weights.push_back({p + "feed_forward.w1.weight", &lw.w_gate});
+        named_weights.push_back({p + "feed_forward.w3.weight", &lw.w_up});
+        named_weights.push_back({p + "feed_forward.w2.weight", &lw.w_down});
     }
-    for (auto& fl : fast_layers_) {
-        wv.push_back(&fl.wqkv); wv.push_back(&fl.wo);
-        wv.push_back(&fl.attn_norm); wv.push_back(&fl.ffn_norm);
-        wv.push_back(&fl.w_gate); wv.push_back(&fl.w_up); wv.push_back(&fl.w_down);
+
+    for (int l = 0; l < cfg_.n_fast_layer; l++) {
+        auto p = "audio_decoder.layers." + std::to_string(l) + ".";
+        auto& fl = fast_layers_[l];
+        named_weights.push_back({p + "attention.wqkv.weight", &fl.wqkv});
+        named_weights.push_back({p + "attention.wo.weight", &fl.wo});
+        named_weights.push_back({p + "attention_norm.weight", &fl.attn_norm});
+        named_weights.push_back({p + "ffn_norm.weight", &fl.ffn_norm});
+        named_weights.push_back({p + "feed_forward.w1.weight", &fl.w_gate});
+        named_weights.push_back({p + "feed_forward.w3.weight", &fl.w_up});
+        named_weights.push_back({p + "feed_forward.w2.weight", &fl.w_down});
     }
+
     size_t tg = 0;
-    for (auto* tv : wv) {
+    for (auto& nw : named_weights) {
+        TensorView* tv = nw.tv;
         size_t nb = tv->nbytes();
-        __half* gp = nullptr;
+        void* gp = nullptr;
         CUDA_CHECK(cudaMalloc(&gp, nb));
         CUDA_CHECK(cudaMemcpy(gp, tv->data, nb, cudaMemcpyHostToDevice));
         gpu_weight_ptrs_.push_back(gp);
+
+        // Look up INT8 per-channel scale
+        std::string scale_name = nw.name + "_scale";
+        __half* scale_gp = nullptr;
+        if (loader_.has(scale_name)) {
+            use_int8_ = true;
+            auto scale_tv = loader_.get(scale_name);
+            CUDA_CHECK(cudaMalloc(&scale_gp, scale_tv.nbytes()));
+            CUDA_CHECK(cudaMemcpy(scale_gp, scale_tv.data, scale_tv.nbytes(),
+                                  cudaMemcpyHostToDevice));
+        }
+        weight_to_scale_[gp] = scale_gp;
         tv->data = gp;
         tg += nb;
     }
-    spdlog::info("GPU weights: {} MB", tg / (1024 * 1024));
+    spdlog::info("GPU weights: {} MB ({})", tg / (1024 * 1024),
+                 use_int8_ ? "INT8" : "FP16");
 }
 
 void DualAREngine::ensure_workspace_tokens(int tokens) {
@@ -201,6 +235,24 @@ void DualAREngine::ensure_workspace_tokens(int tokens) {
     spdlog::info("DualAREngine: workspace={}MB each (max_inner={}, tokens={})",
                  (size_t)tokens * max_inner * sizeof(__half) / (1024*1024),
                  max_inner, tokens);
+}
+
+// ============================================================================
+// quantized_gemm — FP16 cuBLAS or INT8 dequant+GEMM dispatch
+// ============================================================================
+void DualAREngine::quantized_gemm(int M_out, int N_out, int K,
+                                   const TensorView& weight,
+                                   const __half* X, __half* Y) {
+    auto it = weight_to_scale_.find(weight.data);
+    if (it != weight_to_scale_.end() && it->second != nullptr) {
+        // INT8 path: dequant + GEMM in one kernel
+        kernels::int8_dequant_gemm_fp16(
+            static_cast<const int8_t*>(weight.data),
+            it->second, X, Y, M_out, N_out, K, stream_);
+    } else {
+        // FP16 path: standard cuBLAS GEMM
+        gemm_fp16(M_out, N_out, K, weight.as<__half>(), X, Y, cublas_);
+    }
 }
 
 // ============================================================================
@@ -308,7 +360,7 @@ void DualAREngine::prefill(const int32_t* tokens, int B, int T, int prompt_strid
         kernels::rms_norm(curr, lw.attn_norm.as<__half>(), ws1_,
                           n_tokens, dim, cfg_.norm_eps, stream_);
 
-        gemm_fp16(qkv_dim, n_tokens, dim, lw.wqkv.as<__half>(), ws1_, ws2_, cublas_);
+        quantized_gemm(qkv_dim, n_tokens, dim, lw.wqkv, ws1_, ws2_);
 
         // GPU QKV split + transpose: ws2_ [T, qkv_dim] → q_buf_/k_buf_/v_buf_ head-major
         kernels::qkv_split_heads_gqa(ws2_, q_buf_, k_buf_, v_buf_,
@@ -364,7 +416,7 @@ void DualAREngine::prefill(const int32_t* tokens, int B, int T, int prompt_strid
         }
 
         // Wo projection + residual
-        gemm_fp16(dim, n_tokens, n_q * D, lw.wo.as<__half>(), attn_out_buf_, ws1_, cublas_);
+        quantized_gemm(dim, n_tokens, n_q * D, lw.wo, attn_out_buf_, ws1_);
 
         kernels::residual_add(curr, ws1_, n_tokens * dim, stream_);
 
@@ -373,17 +425,17 @@ void DualAREngine::prefill(const int32_t* tokens, int B, int T, int prompt_strid
         kernels::rms_norm(curr, lw.ffn_norm.as<__half>(), ws2_, n_tokens, dim, cfg_.norm_eps, stream_);
 
         // gate = silu(X @ w_gate^T)
-        gemm_fp16(inter, n_tokens, dim, lw.w_gate.as<__half>(), ws2_, ws1_, cublas_);
+        quantized_gemm(inter, n_tokens, dim, lw.w_gate, ws2_, ws1_);
         kernels::silu_forward(ws1_, n_tokens * inter, stream_);
 
         // up = X @ w_up^T
-        gemm_fp16(inter, n_tokens, dim, lw.w_up.as<__half>(), ws2_, attn_out_buf_, cublas_);
+        quantized_gemm(inter, n_tokens, dim, lw.w_up, ws2_, attn_out_buf_);
 
         // gate *= up (element-wise)
         kernels::mul_forward(ws1_, attn_out_buf_, n_tokens * inter, stream_);
 
         // down = (gate*up) @ w_down^T  → output
-        gemm_fp16(dim, n_tokens, inter, lw.w_down.as<__half>(), ws1_, ws2_, cublas_);
+        quantized_gemm(dim, n_tokens, inter, lw.w_down, ws1_, ws2_);
         kernels::residual_add(curr, ws2_, n_tokens * dim, stream_);
 
     }
@@ -439,7 +491,7 @@ void DualAREngine::decode_step(const __half* input_embed, int B, int token_pos,
         // RMSNorm → fused QKV projection
         kernels::rms_norm(curr, lw.attn_norm.as<__half>(), ws1_,
                           B, dim, cfg_.norm_eps, stream_);
-        gemm_fp16(qkv_dim, B, dim, lw.wqkv.as<__half>(), ws1_, ws2_, cublas_);
+        quantized_gemm(qkv_dim, B, dim, lw.wqkv, ws1_, ws2_);
 
         // Split Q, K, V (B=1, so flat layout = head-major layout)
         // ws2_ layout: [B, n_q*D | n_kv*D | n_kv*D]
@@ -487,7 +539,7 @@ void DualAREngine::decode_step(const __half* input_embed, int B, int token_pos,
                                         sm_scale, l, cfg_.n_layer, n_kv, stream_);
 
         // Wo projection + residual
-        gemm_fp16(dim, B, n_q * D, lw.wo.as<__half>(), ws2_, ws1_, cublas_);
+        quantized_gemm(dim, B, n_q * D, lw.wo, ws2_, ws1_);
         kernels::residual_add(curr, ws1_, B * dim, stream_);
 
         // --- SwiGLU FFN ---
@@ -495,13 +547,13 @@ void DualAREngine::decode_step(const __half* input_embed, int B, int token_pos,
         kernels::rms_norm(curr, lw.ffn_norm.as<__half>(), ws2_,
                           B, dim, cfg_.norm_eps, stream_);
 
-        gemm_fp16(inter, B, dim, lw.w_gate.as<__half>(), ws2_, ws1_, cublas_);
+        quantized_gemm(inter, B, dim, lw.w_gate, ws2_, ws1_);
         kernels::silu_forward(ws1_, B * inter, stream_);
 
-        gemm_fp16(inter, B, dim, lw.w_up.as<__half>(), ws2_, attn_out_buf_, cublas_);
+        quantized_gemm(inter, B, dim, lw.w_up, ws2_, attn_out_buf_);
         kernels::mul_forward(ws1_, attn_out_buf_, B * inter, stream_);
 
-        gemm_fp16(dim, B, inter, lw.w_down.as<__half>(), ws1_, ws2_, cublas_);
+        quantized_gemm(dim, B, inter, lw.w_down, ws1_, ws2_);
         kernels::residual_add(curr, ws2_, B * dim, stream_);
     }
 
@@ -519,7 +571,7 @@ void DualAREngine::decode_step(const __half* input_embed, int B, int token_pos,
 // get_logits — project hidden state to vocabulary logits via shared embedding
 // ============================================================================
 void DualAREngine::get_logits(const __half* h, __half* logits, int B) {
-    gemm_fp16(cfg_.vocab_size, B, cfg_.dim, w_embedding_.as<__half>(), h, logits, cublas_);
+    quantized_gemm(cfg_.vocab_size, B, cfg_.dim, w_embedding_, h, logits);
 }
 
 // ============================================================================
@@ -619,7 +671,7 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
         // RMSNorm → fused QKV
         kernels::rms_norm(curr, fl.attn_norm.as<__half>(), ws1_,
                           B, dim, cfg_.norm_eps, stream_);
-        gemm_fp16(fqkv_dim, B, dim, fl.wqkv.as<__half>(), ws1_, ws2_, cublas_);
+        quantized_gemm(fqkv_dim, B, dim, fl.wqkv, ws1_, ws2_);
 
         // Split Q, K, V (B=1)
         size_t q_elems = (size_t)B * fq * fD;
@@ -653,7 +705,7 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
             sm_scale, stream_);
 
         // Wo projection + residual
-        gemm_fp16(dim, B, fq * fD, fl.wo.as<__half>(), attn_out_buf_, ws1_, cublas_);
+        quantized_gemm(dim, B, fq * fD, fl.wo, attn_out_buf_, ws1_);
         kernels::residual_add(curr, ws1_, B * dim, stream_);
 
         // --- SwiGLU FFN ---
@@ -661,20 +713,20 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
                           B, dim, cfg_.norm_eps, stream_);
 
         int fi = cfg_.fast_intermediate_size;
-        gemm_fp16(fi, B, dim, fl.w_gate.as<__half>(), ws2_, ws1_, cublas_);
+        quantized_gemm(fi, B, dim, fl.w_gate, ws2_, ws1_);
         kernels::silu_forward(ws1_, B * fi, stream_);
 
-        gemm_fp16(fi, B, dim, fl.w_up.as<__half>(), ws2_, attn_out_buf_, cublas_);
+        quantized_gemm(fi, B, dim, fl.w_up, ws2_, attn_out_buf_);
         kernels::mul_forward(ws1_, attn_out_buf_, B * fi, stream_);
 
-        gemm_fp16(dim, B, fi, fl.w_down.as<__half>(), ws1_, ws2_, cublas_);
+        quantized_gemm(dim, B, fi, fl.w_down, ws1_, ws2_);
         kernels::residual_add(curr, ws2_, B * dim, stream_);
     }
 
     if (compute_logits) {
         kernels::rms_norm(curr, w_fast_norm_.as<__half>(), ws1_,
                           B, dim, cfg_.norm_eps, stream_);
-        gemm_fp16(cb, B, dim, w_fast_output_.as<__half>(), ws1_, logits, cublas_);
+        quantized_gemm(cb, B, dim, w_fast_output_, ws1_, logits);
     }
 
     // Copy pre-norm hidden → codebook_hidden for next step's input
