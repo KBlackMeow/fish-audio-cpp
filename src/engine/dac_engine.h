@@ -60,7 +60,6 @@ private:
     cudaStream_t stream_;
 
     bool use_int8_ = false;
-    std::unordered_map<void*, __half*> weight_to_scale_;
 
     // --- RVQ weights on GPU ---
     // Codebook embeddings: [codebook_size, DAC_CODEBOOK_DIM] (FP16)
@@ -95,7 +94,9 @@ private:
         __half* weight = nullptr;
         __half* bias = nullptr;
         __half* scale = nullptr;      // INT8 per-channel scale (null if FP16)
+        __half* act_scale = nullptr;  // static activation quant scale (null => dynamic)
         __half* smooth_inv = nullptr; // calibration smooth factor (null if none)
+        int group_size = 0;           // K for row-wise, smaller for group-wise
         int out = 0;
         int in = 0;
     };

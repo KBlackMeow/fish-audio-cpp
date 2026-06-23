@@ -1,0 +1,63 @@
+[22:59:07] [info] === Fish Audio S2 Pro TTS ===
+[22:59:07] [info]   model-dir : /home/illya/fish-audio-cpp/models/s2-pro-int8-w8a8-g256
+[22:59:07] [info]   text      : 'Hello world, this is a short W8A8 profiling run.'
+[22:59:07] [info]   output    : /home/illya/fish-audio-cpp/output/profile_w8a8/int8_g256.wav
+[22:59:07] [info]   dtype     : int8
+[22:59:07] [info] Loading DualAR config …
+[22:59:07] [info] DualARConfig: dim=2560 n_layer=36 n_head=32 n_kv=8 head_dim=128 qk_norm=true
+[22:59:07] [info]   fast: dim=2560 n_layer=4 n_head=32 n_kv=8 codebook=4096x10
+[22:59:07] [info]   special: semantic=[151678,155773] eos=151645 vocab=155776
+[22:59:07] [info]   text: layers=36 dim=2560 n_head=32 n_kv_head=8 vocab=155776
+[22:59:07] [info]   fast: layers=4 codebook_size=4096 num_codebooks=10
+[22:59:07] [info] Resolved model: /home/illya/fish-audio-cpp/models/s2-pro-int8-w8a8-g256/dual_ar.bin
+[22:59:07] [info] Loading 679 tensors from /home/illya/fish-audio-cpp/models/s2-pro-int8-w8a8-g256/dual_ar.bin
+[22:59:07] [info] Loaded 679 tensors, data section at offset 233588
+[22:59:07] [info] Uploading DualAR weights to GPU …
+[22:59:07] [info] DualAREngine: workspace=4MB each (max_inner=9728, tokens=256)
+[22:59:10] [info] GPU weights: 4841 MB (INT8 runtime=W8A8)
+[22:59:10] [info] Loading DAC config …
+[22:59:10] [info] DACConfig: dim=512 n_layer=8 hop=512 pos=rope
+[22:59:10] [info] Resolved model: /home/illya/fish-audio-cpp/models/s2-pro-int8-w8a8-g256/dac.bin
+[22:59:10] [info] Loading 458 tensors from /home/illya/fish-audio-cpp/models/s2-pro-int8-w8a8-g256/dac.bin
+[22:59:10] [info] Loaded 458 tensors, data section at offset 157564
+[22:59:10] [info] DACEngine: hop=512 sample_rate=44100 num_codebooks=10
+[22:59:10] [info] DACEngine::init: loading 10 codebooks to GPU
+[22:59:10] [info] DACEngine::init: loaded 34 native decoder conv weights
+[22:59:10] [info] DACEngine::init: encoder weights loaded (68 conv + 108 dense + 156 vector total, 10 RVQ in_proj)
+[22:59:10] [info] DACEngine::init: GPU RVQ ready, 10 codebooks uploaded
+[22:59:10] [info] Loading tokenizer …
+[22:59:11] [info] Tokenizer: native ByteLevel BPE → /home/illya/fish-audio-cpp/models/s2-pro-int8-w8a8-g256/tokenizer.json (vocab=151643, merges=151387, specials=4131)
+[22:59:11] [info] BlockManager: 34 total blocks, 76 MB KV cache
+[22:59:11] [info] Allocating 76 MB for KV cache (38 MB per k/v)
+[22:59:11] [info] InferencePipeline: using unified CUDA stream
+[22:59:11] [info] InferencePipeline::run: text='Hello world, this is a short W8A8 profiling run.' max_new=32
+[22:59:11] [info]   Tokenized 172 chars → 34 tokens (native BPE)
+[22:59:11] [info]   Tokenized: 34 tokens
+[22:59:11] [info]   Prefill → first sem token: 151879
+[22:59:29] [info]   Generated 32 frames (1+10 tokens each)
+[22:59:29] [info]   DAC input: 32 code frames x 10 codebooks
+[22:59:29] [info]   cb[0] range: [130, 4073]
+[22:59:29] [info]   cb[1] range: [8, 998]
+[22:59:29] [info]   cb[2] range: [55, 1016]
+[22:59:29] [info]   cb[3] range: [49, 995]
+[22:59:29] [info]   cb[4] range: [50, 997]
+[22:59:29] [info]   cb[5] range: [6, 1019]
+[22:59:29] [info]   cb[6] range: [10, 1005]
+[22:59:29] [info]   cb[7] range: [20, 1013]
+[22:59:29] [info]   cb[8] range: [0, 1017]
+[22:59:29] [info]   cb[9] range: [9, 885]
+[22:59:29] [info] DACEngine::decode: 32 code frames → 65536 samples (1.49s)
+[22:59:29] [info]   Audio: 65536 samples (1.49s @ 44100Hz)
+[22:59:29] [info] WAV saved: /home/illya/fish-audio-cpp/output/profile_w8a8/int8_g256.wav (65536 samples, 44100Hz)
+[22:59:29] [info] === done ===
+[22:59:29] [info] INT8 profile summary:
+[22:59:29] [info]   M=4096 N=1 K=2560 group=256 act=dynamic smooth=no calls=297 avg_groups=10.0 total=49.823ms avg=0.168ms (quant=0.007 memset=0.005 gemm=0.093 accum=0.058 cast=0.005)
+[22:59:29] [info]   M=2560 N=1 K=9728 group=256 act=dynamic smooth=no calls=2472 avg_groups=38.0 total=1396.264ms avg=0.565ms (quant=0.006 memset=0.005 gemm=0.333 accum=0.215 cast=0.006)
+[22:59:29] [info]   M=9728 N=1 K=2560 group=256 act=dynamic smooth=yes calls=4944 avg_groups=10.0 total=1058.179ms avg=0.214ms (quant=0.007 memset=0.005 gemm=0.140 accum=0.057 cast=0.005)
+[22:59:29] [info]   M=6144 N=1 K=2560 group=256 act=dynamic smooth=yes calls=2472 avg_groups=10.0 total=523.513ms avg=0.212ms (quant=0.007 memset=0.006 gemm=0.118 accum=0.076 cast=0.005)
+[22:59:29] [info]   M=2560 N=34 K=9728 group=256 act=dynamic smooth=no calls=36 avg_groups=38.0 total=18.138ms avg=0.504ms (quant=0.007 memset=0.016 gemm=0.298 accum=0.179 cast=0.004)
+[22:59:29] [info]   M=9728 N=34 K=2560 group=256 act=dynamic smooth=yes calls=72 avg_groups=10.0 total=16.098ms avg=0.224ms (quant=0.005 memset=0.005 gemm=0.140 accum=0.068 cast=0.006)
+[22:59:29] [info]   M=2560 N=34 K=4096 group=256 act=dynamic smooth=no calls=36 avg_groups=16.0 total=7.238ms avg=0.201ms (quant=0.012 memset=0.006 gemm=0.103 accum=0.076 cast=0.004)
+[22:59:29] [info]   M=2560 N=1 K=4096 group=256 act=dynamic smooth=no calls=2472 avg_groups=16.0 total=613.729ms avg=0.248ms (quant=0.007 memset=0.006 gemm=0.137 accum=0.093 cast=0.005)
+[22:59:29] [info]   M=6144 N=34 K=2560 group=256 act=dynamic smooth=yes calls=36 avg_groups=10.0 total=9.304ms avg=0.258ms (quant=0.007 memset=0.005 gemm=0.181 accum=0.059 cast=0.007)
+wall=0:21.88s rss=6174408KB

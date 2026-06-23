@@ -73,6 +73,13 @@ public:
                               int32_t prev_token = 0, bool compute_logits = true);
 
 private:
+    struct QuantMeta {
+        __half* scale = nullptr;
+        __half* act_scale = nullptr;
+        __half* smooth_inv = nullptr;
+        int group_size = 0;
+    };
+
     void text_attention_prefill(const __half* input, __half* output,
                                 __half* k_out, __half* v_out,
                                 const TextLayerWeights& lw, int B, int T, int layer_idx);
@@ -88,9 +95,7 @@ private:
 
     // INT8 quantization support
     bool use_int8_ = false;
-    // Maps GPU weight data pointer -> (scale, smooth_inv) GPU pointers (null if FP16)
-    std::unordered_map<void*, __half*> weight_to_scale_;
-    std::unordered_map<void*, __half*> weight_to_smooth_inv_;
+    std::unordered_map<void*, QuantMeta> weight_quant_meta_;
     // Dispatch GEMM: FP16 cuBLAS or INT8 dequant+GEMM based on weight type
     void quantized_gemm(int M_out, int N_out, int K,
                         const TensorView& weight,

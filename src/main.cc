@@ -331,17 +331,18 @@ static std::string build_reference_prompt_file(
 
 // Resolve model file path.  Directory layout:
 //   model_dir/models/model-fp16/dual_ar.bin    (new: recommended)
-//   model_dir/models/model-int8-w8a16/dac.bin
+//   model_dir/models/model-int8-w8a8/dac.bin
 //   model_dir/dual_ar_fp16.bin                 (legacy: flat, still works)
-// --dtype maps shorthand: int8 → int8-w8a16
-// Auto-detect priority: int8-w8a16 > fp16 > bf16 > unsuffixed (legacy).
+//   model_dir/dual_ar.bin                      (concrete model dir, still works)
+// --dtype maps shorthand: int8 → int8-w8a8
+// Auto-detect priority: int8-w8a8 > int8-w8a16 > fp16 > bf16 > unsuffixed.
 static std::string resolve_model_path(
     const std::string& model_dir,
     const std::string& basename,   // "dual_ar" or "dac"
     const std::string& dtype_override = "")
 {
     auto suffix_for = [](const std::string& dt) -> std::string {
-        if (dt == "int8") return "int8-w8a16";
+        if (dt == "int8") return "int8-w8a8";
         return dt;
     };
 
@@ -357,13 +358,15 @@ static std::string resolve_model_path(
 
     auto dir = std::filesystem::path(model_dir);
     auto model_name = dir.filename().string();  // e.g. "s2-pro"
-    // Search models/<model>-<dtype>/ at project root, then parent, then model_dir
+    // Search models/<model>-<dtype>/ at project root, then parent, then
+    // concrete files inside model_dir itself.
     auto candidates = [&](const std::string& suffix) -> std::vector<std::string> {
         auto sub = "/models/" + model_name + "-" + suffix + "/" + basename + ".bin";
         return {
             dir.parent_path().parent_path().string() + sub,  // ../../models/
             dir.parent_path().string() + sub,                // ../models/
             model_dir + sub,                                  // models/ inside model_dir
+            model_dir + "/" + basename + ".bin",             // concrete model dir
             model_dir + "/" + basename + "_" + suffix + ".bin",  // legacy flat
         };
     };
@@ -376,7 +379,7 @@ static std::string resolve_model_path(
             "Requested dtype '" + dtype_override + "', not found in " + model_dir);
     }
 
-    static const char* suffixes[] = {"int8-w8a16", "fp16", "bf16", ""};
+    static const char* suffixes[] = {"int8-w8a8", "int8-w8a16", "fp16", "bf16", ""};
     for (const char* suf : suffixes) {
         auto path = try_resolve(candidates(suf));
         if (!path.empty()) return path;
@@ -430,7 +433,7 @@ static int run_main(int argc, char* argv[]) {
         ("port",            "Server port",
          cxxopts::value<int>()->default_value("8080"))
         ("h,help",         "Print usage")
-        ("dtype",          "Precision: fp16, int8 (→int8-w8a16). Default: auto-detect",
+        ("dtype",          "Precision: fp16, int8 (→int8-w8a8). Default: auto-detect",
          cxxopts::value<std::string>()->default_value(""));
 
     auto args = opts.parse(argc, argv);

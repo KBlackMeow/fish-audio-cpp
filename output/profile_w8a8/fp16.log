@@ -1,0 +1,53 @@
+[22:57:49] [info] === Fish Audio S2 Pro TTS ===
+[22:57:49] [info]   model-dir : /home/illya/fish-audio-cpp/checkpoints/s2-pro
+[22:57:49] [info]   text      : 'Hello world, this is a short W8A8 profiling run.'
+[22:57:49] [info]   output    : /home/illya/fish-audio-cpp/output/profile_w8a8/fp16.wav
+[22:57:49] [info]   dtype     : fp16
+[22:57:49] [info] Loading DualAR config …
+[22:57:49] [info] DualARConfig: dim=2560 n_layer=36 n_head=32 n_kv=8 head_dim=128 qk_norm=true
+[22:57:49] [info]   fast: dim=2560 n_layer=4 n_head=32 n_kv=8 codebook=4096x10
+[22:57:49] [info]   special: semantic=[151678,155773] eos=151645 vocab=155776
+[22:57:49] [info]   text: layers=36 dim=2560 n_head=32 n_kv_head=8 vocab=155776
+[22:57:49] [info]   fast: layers=4 codebook_size=4096 num_codebooks=10
+[22:57:49] [info] Resolved model: /home/illya/fish-audio-cpp/models/s2-pro-fp16/dual_ar.bin
+[22:57:49] [info] Loading 358 tensors from /home/illya/fish-audio-cpp/models/s2-pro-fp16/dual_ar.bin
+[22:57:49] [info] Loaded 358 tensors, data section at offset 123164
+[22:57:49] [info] Uploading DualAR weights to GPU …
+[22:57:49] [info] DualAREngine: workspace=4MB each (max_inner=9728, tokens=256)
+[22:57:50] [info] GPU weights: 8701 MB (FP16)
+[22:57:50] [info] Loading DAC config …
+[22:57:50] [info] DACConfig: dim=512 n_layer=8 hop=512 pos=rope
+[22:57:50] [info] Resolved model: /home/illya/fish-audio-cpp/models/s2-pro-fp16/dac.bin
+[22:57:50] [info] Loading 458 tensors from /home/illya/fish-audio-cpp/models/s2-pro-fp16/dac.bin
+[22:57:50] [info] Loaded 458 tensors, data section at offset 157564
+[22:57:50] [info] DACEngine: hop=512 sample_rate=44100 num_codebooks=10
+[22:57:50] [info] DACEngine::init: loading 10 codebooks to GPU
+[22:57:50] [info] DACEngine::init: loaded 34 native decoder conv weights
+[22:57:50] [info] DACEngine::init: encoder weights loaded (68 conv + 108 dense + 156 vector total, 10 RVQ in_proj)
+[22:57:50] [info] DACEngine::init: GPU RVQ ready, 10 codebooks uploaded
+[22:57:50] [info] Loading tokenizer …
+[22:57:50] [info] Tokenizer: native ByteLevel BPE → /home/illya/fish-audio-cpp/checkpoints/s2-pro/tokenizer.json (vocab=151643, merges=151387, specials=4131)
+[22:57:50] [info] BlockManager: 34 total blocks, 76 MB KV cache
+[22:57:50] [info] Allocating 76 MB for KV cache (38 MB per k/v)
+[22:57:50] [info] InferencePipeline: using unified CUDA stream
+[22:57:50] [info] InferencePipeline::run: text='Hello world, this is a short W8A8 profiling run.' max_new=32
+[22:57:50] [info]   Tokenized 172 chars → 34 tokens (native BPE)
+[22:57:50] [info]   Tokenized: 34 tokens
+[22:57:51] [info]   Prefill → first sem token: 151879
+[22:57:53] [info]   Generated 32 frames (1+10 tokens each)
+[22:57:53] [info]   DAC input: 32 code frames x 10 codebooks
+[22:57:53] [info]   cb[0] range: [72, 4087]
+[22:57:53] [info]   cb[1] range: [7, 971]
+[22:57:53] [info]   cb[2] range: [43, 958]
+[22:57:53] [info]   cb[3] range: [51, 1008]
+[22:57:53] [info]   cb[4] range: [13, 999]
+[22:57:53] [info]   cb[5] range: [106, 1008]
+[22:57:53] [info]   cb[6] range: [8, 983]
+[22:57:53] [info]   cb[7] range: [27, 1012]
+[22:57:53] [info]   cb[8] range: [15, 998]
+[22:57:53] [info]   cb[9] range: [70, 1013]
+[22:57:53] [info] DACEngine::decode: 32 code frames → 65536 samples (1.49s)
+[22:57:53] [info]   Audio: 65536 samples (1.49s @ 44100Hz)
+[22:57:53] [info] WAV saved: /home/illya/fish-audio-cpp/output/profile_w8a8/fp16.wav (65536 samples, 44100Hz)
+[22:57:53] [info] === done ===
+wall=0:04.59s rss=10535972KB

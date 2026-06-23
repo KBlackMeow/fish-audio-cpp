@@ -6,10 +6,29 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <fstream>
 #include <filesystem>
 
 namespace fish {
+
+namespace {
+
+int infer_group_size_from_scale(const TensorView& weight_tv, const TensorView& scale_tv) {
+    int64_t K = 1;
+    for (size_t i = 1; i < weight_tv.shape.size(); ++i) K *= weight_tv.shape[i];
+    if (scale_tv.shape.size() <= 1) return static_cast<int>(K);
+    int64_t groups = scale_tv.shape[1];
+    if (groups <= 1) return static_cast<int>(K);
+    return static_cast<int>((K + groups - 1) / groups);
+}
+
+bool use_static_act_scale() {
+    const char* v = std::getenv("FISH_INT8_STATIC_ACT_SCALE");
+    return v && std::strcmp(v, "1") == 0;
+}
+
+}  // namespace
 
 // ============================================================================
 // GEMM helper: Y[M,N] = X[M,K] × W[N,K]^T   (all row-major)
@@ -103,6 +122,7 @@ DualAREngine::~DualAREngine() {
 // FISH_CALIBRATE_DIR is set. Used for SmoothQuant activation calibration.
 // ============================================================================
 static std::string g_cal_dir;
+static std::atomic<uint64_t> g_cal_dump_id{0};
 
 static void calibrate_dump(const char* tag, int layer, const __half* data,
                             int n_tokens, int dim, cudaStream_t stream) {
@@ -112,8 +132,11 @@ static void calibrate_dump(const char* tag, int layer, const __half* data,
     cudaMemcpy(h.data(), data, n * sizeof(__half), cudaMemcpyDeviceToHost);
     cudaStreamSynchronize(stream);
 
+    uint64_t dump_id = g_cal_dump_id.fetch_add(1, std::memory_order_relaxed);
     char path[512];
-    snprintf(path, sizeof(path), "%s/L%02d_%s.bin", g_cal_dir.c_str(), layer, tag);
+    snprintf(path, sizeof(path), "%s/L%02d_%s_%06llu.bin",
+             g_cal_dir.c_str(), layer, tag,
+             static_cast<unsigned long long>(dump_id));
     std::ofstream f(path, std::ios::binary);
     // Header: int32 n_tokens, int32 dim, then raw FP16 data
     int32_t hdr[2] = {static_cast<int32_t>(n_tokens),
@@ -217,15 +240,15 @@ void DualAREngine::init() {
         // Look up INT8 per-channel scale
         std::string scale_name = nw.name + "_scale";
         __half* scale_gp = nullptr;
+        __half* act_scale_gp = nullptr;
         if (loader_.has(scale_name)) {
             use_int8_ = true;
             auto scale_tv = loader_.get(scale_name);
             CUDA_CHECK(cudaMalloc(&scale_gp, scale_tv.nbytes()));
             CUDA_CHECK(cudaMemcpy(scale_gp, scale_tv.data, scale_tv.nbytes(),
                                   cudaMemcpyHostToDevice));
+            gpu_weight_ptrs_.push_back(scale_gp);
         }
-        weight_to_scale_[gp] = scale_gp;
-
         // Look up calibration smooth_inv
         std::string smooth_name = nw.name + "_smooth_inv";
         __half* smooth_gp = nullptr;
@@ -234,13 +257,27 @@ void DualAREngine::init() {
             CUDA_CHECK(cudaMalloc(&smooth_gp, smooth_tv.nbytes()));
             CUDA_CHECK(cudaMemcpy(smooth_gp, smooth_tv.data, smooth_tv.nbytes(),
                                   cudaMemcpyHostToDevice));
+            gpu_weight_ptrs_.push_back(smooth_gp);
         }
-        weight_to_smooth_inv_[gp] = smooth_gp;
+        std::string act_scale_name = nw.name + "_act_scale";
+        if (use_static_act_scale() && loader_.has(act_scale_name)) {
+            auto act_scale_tv = loader_.get(act_scale_name);
+            CUDA_CHECK(cudaMalloc(&act_scale_gp, act_scale_tv.nbytes()));
+            CUDA_CHECK(cudaMemcpy(act_scale_gp, act_scale_tv.data, act_scale_tv.nbytes(),
+                                  cudaMemcpyHostToDevice));
+            gpu_weight_ptrs_.push_back(act_scale_gp);
+        }
+        int group_size = 0;
+        if (scale_gp != nullptr) {
+            auto scale_tv = loader_.get(scale_name);
+            group_size = infer_group_size_from_scale(*tv, scale_tv);
+        }
+        weight_quant_meta_[gp] = QuantMeta{scale_gp, act_scale_gp, smooth_gp, group_size};
         tv->data = gp;
         tg += nb;
     }
     spdlog::info("GPU weights: {} MB ({})", tg / (1024 * 1024),
-                 use_int8_ ? "INT8" : "FP16");
+                 use_int8_ ? "INT8 runtime=W8A8" : "FP16");
 }
 
 void DualAREngine::ensure_workspace_tokens(int tokens) {
@@ -290,15 +327,14 @@ void DualAREngine::ensure_workspace_tokens(int tokens) {
 void DualAREngine::quantized_gemm(int M_out, int N_out, int K,
                                    const TensorView& weight,
                                    const __half* X, __half* Y) {
-    auto it = weight_to_scale_.find(weight.data);
-    if (it != weight_to_scale_.end() && it->second != nullptr) {
+    auto qit = weight_quant_meta_.find(weight.data);
+    if (qit != weight_quant_meta_.end() && qit->second.scale != nullptr) {
         // INT8 path: dequant + GEMM (with optional calibration smooth)
-        __half* smooth_inv = nullptr;
-        auto sit = weight_to_smooth_inv_.find(weight.data);
-        if (sit != weight_to_smooth_inv_.end()) smooth_inv = sit->second;
+        const auto& meta = qit->second;
         kernels::int8_dequant_gemm_fp16(
             static_cast<const int8_t*>(weight.data),
-            it->second, smooth_inv, X, Y, M_out, N_out, K, cublas_, stream_);
+            meta.scale, meta.group_size, meta.act_scale, meta.smooth_inv,
+            X, Y, M_out, N_out, K, cublas_, stream_);
     } else {
         // FP16 path: standard cuBLAS GEMM
         gemm_fp16(M_out, N_out, K, weight.as<__half>(), X, Y, cublas_);
