@@ -89,4 +89,94 @@ void rope_qk(
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void fast_qk_split_rope_cache_kernel(
+    const __half* __restrict__ qkv,
+    __half* __restrict__ q_out,
+    __half* __restrict__ k_cache_layer,
+    const float* __restrict__ freqs,
+    int n_q,
+    int n_kv,
+    int head_dim,
+    int position,
+    int max_len)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_pairs = n_q * (head_dim / 2);
+    int k_pairs = n_kv * (head_dim / 2);
+    int total = max(q_pairs, k_pairs);
+    if (idx >= total) return;
+
+    if (idx < q_pairs) {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        float angle = freqs[pair] * static_cast<float>(position);
+        float c = cosf(angle), s = sinf(angle);
+        int src = head * head_dim + pair * 2;
+        float x0 = __half2float(qkv[src]);
+        float x1 = __half2float(qkv[src + 1]);
+        int dst = src;
+        q_out[dst] = __float2half(x0 * c - x1 * s);
+        q_out[dst + 1] = __float2half(x0 * s + x1 * c);
+    }
+
+    if (idx < k_pairs) {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        float angle = freqs[pair] * static_cast<float>(position);
+        float c = cosf(angle), s = sinf(angle);
+        int src = n_q * head_dim + head * head_dim + pair * 2;
+        float x0 = __half2float(qkv[src]);
+        float x1 = __half2float(qkv[src + 1]);
+        int dst = (head * max_len + position) * head_dim + pair * 2;
+        k_cache_layer[dst] = __float2half(x0 * c - x1 * s);
+        k_cache_layer[dst + 1] = __float2half(x0 * s + x1 * c);
+    }
+}
+
+__global__ void fast_v_cache_scatter_kernel(
+    const __half* __restrict__ qkv,
+    __half* __restrict__ v_cache_layer,
+    int n_q,
+    int n_kv,
+    int head_dim,
+    int position,
+    int max_len)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_kv * head_dim;
+    if (idx >= total) return;
+    int head = idx / head_dim;
+    int d = idx % head_dim;
+    int src = (n_q + n_kv) * head_dim + idx;
+    int dst = (head * max_len + position) * head_dim + d;
+    v_cache_layer[dst] = qkv[src];
+}
+
+void fast_qkv_split_rope_cache(
+    const __half* qkv,
+    __half* q_out,
+    __half* k_cache_layer,
+    __half* v_cache_layer,
+    const float* freqs,
+    int n_q,
+    int n_kv,
+    int head_dim,
+    int position,
+    int max_len,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int qk_pairs = max(n_q, n_kv) * (head_dim / 2);
+    int qk_blocks = fish::div_up(qk_pairs, threads);
+    fast_qk_split_rope_cache_kernel<<<qk_blocks, threads, 0, stream>>>(
+        qkv, q_out, k_cache_layer, freqs, n_q, n_kv, head_dim, position, max_len);
+    CUDA_CHECK(cudaGetLastError());
+
+    int v_total = n_kv * head_dim;
+    int v_blocks = fish::div_up(v_total, threads);
+    fast_v_cache_scatter_kernel<<<v_blocks, threads, 0, stream>>>(
+        qkv, v_cache_layer, n_q, n_kv, head_dim, position, max_len);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace fish::kernels

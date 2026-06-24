@@ -735,6 +735,23 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
                                         int B, int codebook_step, int32_t prev_token,
                                         bool compute_logits)
 {
+    if (codebook_step == 0) {
+        fast_codebook_decode_device(fast_hidden, codebook_hidden, logits,
+                                    B, codebook_step, nullptr, compute_logits);
+        return;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d_scratch_int_, &prev_token, sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream_));
+    fast_codebook_decode_device(fast_hidden, codebook_hidden, logits,
+                                B, codebook_step, d_scratch_int_, compute_logits);
+}
+
+void DualAREngine::fast_codebook_decode_device(const __half* fast_hidden,
+                                               __half* codebook_hidden, __half* logits,
+                                               int B, int codebook_step,
+                                               const int32_t* prev_token_device,
+                                               bool compute_logits)
+{
     int dim = cfg_.fast_dim, fq = cfg_.fast_n_head, fkv = cfg_.fast_n_local_heads;
     int fD = cfg_.fast_head_dim, cb = cfg_.codebook_size;
     int fqkv_dim = (fq + 2 * fkv) * fD;
@@ -746,11 +763,10 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
         CUDA_CHECK(cudaMemcpyAsync(ws3_, fast_hidden, B * dim * sizeof(__half),
                                    cudaMemcpyDeviceToDevice, stream_));
     } else {
-        // Embed the previous codebook token via the fast embeddings table
-        // fast_embed_tokens expects GPU token array, so upload prev_token
-        CUDA_CHECK(cudaMemcpyAsync(d_scratch_int_, &prev_token, sizeof(int32_t),
-                                   cudaMemcpyHostToDevice, stream_));
-        fast_embed_tokens(d_scratch_int_, ws3_, 1);  // ws3_: [1, dim]
+        if (!prev_token_device)
+            throw std::runtime_error("fast_codebook_decode_device: prev_token_device is null");
+        // Embed the previous codebook token via the fast embeddings table.
+        fast_embed_tokens(prev_token_device, ws3_, 1);  // ws3_: [1, dim]
     }
     __half* curr = ws3_;
 
@@ -764,32 +780,11 @@ void DualAREngine::fast_codebook_decode(const __half* fast_hidden,
         calibrate_dump("fast_attn", l, ws1_, B, dim, stream_);
         quantized_gemm(fqkv_dim, B, dim, fl.wqkv, ws1_, ws2_);
 
-        // Split Q, K, V (B=1)
-        size_t q_elems = (size_t)B * fq * fD;
-        size_t kv_elems = (size_t)B * fkv * fD;
-        CUDA_CHECK(cudaMemcpyAsync(q_buf_, ws2_, q_elems * sizeof(__half),
-                                   cudaMemcpyDeviceToDevice, stream_));
-        CUDA_CHECK(cudaMemcpyAsync(k_buf_, ws2_ + B * fq * fD, kv_elems * sizeof(__half),
-                                   cudaMemcpyDeviceToDevice, stream_));
-        CUDA_CHECK(cudaMemcpyAsync(v_buf_, ws2_ + B * (fq + fkv) * fD, kv_elems * sizeof(__half),
-                                   cudaMemcpyDeviceToDevice, stream_));
-
-        // RoPE (fast decoder uses fast_rope_freqs_, offset = codebook_step)
-        kernels::rope_qk(q_buf_, k_buf_, fast_rope_freqs_,
-                         B, fq, fkv, 1, fD, codebook_step, stream_);
-
-        // Write K/V to fast decoder cache at position codebook_step
-        // Cache layout: [n_fast_layer, n_kv_heads, num_codebooks, head_dim]
-        for (int h = 0; h < fkv; h++) {
-            size_t off = (((size_t)l * fkv + h) * cfg_.num_codebooks + codebook_step) * fD;
-            CUDA_CHECK(cudaMemcpyAsync(fast_k_cache_ + off, k_buf_ + h * fD,
-                                       fD * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
-            CUDA_CHECK(cudaMemcpyAsync(fast_v_cache_ + off, v_buf_ + h * fD,
-                                       fD * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
-        }
-
         const size_t layer_cache_off =
             static_cast<size_t>(l) * fkv * cfg_.num_codebooks * fD;
+        kernels::fast_qkv_split_rope_cache(
+            ws2_, q_buf_, fast_k_cache_ + layer_cache_off, fast_v_cache_ + layer_cache_off,
+            fast_rope_freqs_, fq, fkv, fD, codebook_step, cfg_.num_codebooks, stream_);
         kernels::fast_attention_decode(
             q_buf_, fast_k_cache_ + layer_cache_off, fast_v_cache_ + layer_cache_off,
             attn_out_buf_, B, fq, fkv, fD, T_kv, cfg_.num_codebooks,

@@ -14,9 +14,11 @@
 #include "utils/cuda_utils.h"
 #include <spdlog/spdlog.h>
 #include <cuda_fp16.h>
+#include <sm_61_intrinsics.h>
 #include <cublas_v2.h>
 #include <cstdlib>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -240,6 +242,143 @@ __global__ void float_to_half_kernel(
     if (idx < n) dst[idx] = __float2half(src[idx]);
 }
 
+__global__ void int8_matvec_dequant_kernel(
+    const int8_t* __restrict__ W,
+    const __half* __restrict__ w_scale,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ x_q,
+    __half* __restrict__ Y,
+    int M,
+    int K,
+    int groups,
+    int group_size)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    const int8_t* w_row = W + static_cast<size_t>(row) * K;
+    float local = 0.0f;
+    for (int g = 0; g < groups; ++g) {
+        int start = g * group_size;
+        int end = min(start + group_size, K);
+        if (start >= end) break;
+
+        const int8_t* w_group = w_row + start;
+        const int8_t* x_group = x_q + start;
+        int width = end - start;
+        int dot = 0;
+
+        int vec4 = width / 4;
+        const int* w4 = reinterpret_cast<const int*>(w_group);
+        const int* x4 = reinterpret_cast<const int*>(x_group);
+        for (int i = threadIdx.x; i < vec4; i += blockDim.x) {
+#if __CUDA_ARCH__ >= 610
+            dot = __dp4a(w4[i], x4[i], dot);
+#else
+            int base = i * 4;
+            dot += static_cast<int>(w_group[base + 0]) * static_cast<int>(x_group[base + 0]);
+            dot += static_cast<int>(w_group[base + 1]) * static_cast<int>(x_group[base + 1]);
+            dot += static_cast<int>(w_group[base + 2]) * static_cast<int>(x_group[base + 2]);
+            dot += static_cast<int>(w_group[base + 3]) * static_cast<int>(x_group[base + 3]);
+#endif
+        }
+        for (int k = vec4 * 4 + threadIdx.x; k < width; k += blockDim.x) {
+            dot += static_cast<int>(w_group[k]) * static_cast<int>(x_group[k]);
+        }
+
+        float ws = groups == 1
+            ? __half2float(w_scale[row])
+            : __half2float(w_scale[static_cast<size_t>(row) * groups + g]);
+        local += static_cast<float>(dot) * ws * x_scale[g];
+    }
+
+    __shared__ float reduce_buf[kThreads];
+    reduce_buf[threadIdx.x] = local;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce_buf[threadIdx.x] += reduce_buf[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        Y[row] = __float2half(reduce_buf[0]);
+    }
+}
+
+__global__ void int8_smallbatch_dequant_kernel(
+    const int8_t* __restrict__ W,
+    const __half* __restrict__ w_scale,
+    const float* __restrict__ x_scale,
+    const int8_t* __restrict__ x_q,
+    __half* __restrict__ Y,
+    int M,
+    int N,
+    int K,
+    int groups,
+    int group_size)
+{
+    int row = blockIdx.x;
+    int col = blockIdx.y;
+    if (row >= M || col >= N) return;
+
+    const int8_t* w_row = W + static_cast<size_t>(row) * K;
+    const int8_t* x_row = x_q + static_cast<size_t>(col) * K;
+    const float* x_scale_row = x_scale + static_cast<size_t>(col) * groups;
+
+    float local = 0.0f;
+    for (int g = 0; g < groups; ++g) {
+        int start = g * group_size;
+        int end = min(start + group_size, K);
+        if (start >= end) break;
+
+        const int8_t* w_group = w_row + start;
+        const int8_t* x_group = x_row + start;
+        int width = end - start;
+        int dot = 0;
+
+        int vec4 = width / 4;
+        const int* w4 = reinterpret_cast<const int*>(w_group);
+        const int* x4 = reinterpret_cast<const int*>(x_group);
+        for (int i = threadIdx.x; i < vec4; i += blockDim.x) {
+#if __CUDA_ARCH__ >= 610
+            dot = __dp4a(w4[i], x4[i], dot);
+#else
+            int base = i * 4;
+            dot += static_cast<int>(w_group[base + 0]) * static_cast<int>(x_group[base + 0]);
+            dot += static_cast<int>(w_group[base + 1]) * static_cast<int>(x_group[base + 1]);
+            dot += static_cast<int>(w_group[base + 2]) * static_cast<int>(x_group[base + 2]);
+            dot += static_cast<int>(w_group[base + 3]) * static_cast<int>(x_group[base + 3]);
+#endif
+        }
+        for (int k = vec4 * 4 + threadIdx.x; k < width; k += blockDim.x) {
+            dot += static_cast<int>(w_group[k]) * static_cast<int>(x_group[k]);
+        }
+
+        float ws = groups == 1
+            ? __half2float(w_scale[row])
+            : __half2float(w_scale[static_cast<size_t>(row) * groups + g]);
+        local += static_cast<float>(dot) * ws * x_scale_row[g];
+    }
+
+    __shared__ float reduce_buf[kThreads];
+    reduce_buf[threadIdx.x] = local;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce_buf[threadIdx.x] += reduce_buf[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        Y[static_cast<size_t>(col) * M + row] = __float2half(reduce_buf[0]);
+    }
+}
+
 }  // namespace
 
 void int8_dequant_gemm_fp16(
@@ -284,13 +423,49 @@ void int8_dequant_gemm_fp16(
     auto launch_memset = [&] {
         CUDA_CHECK(cudaMemsetAsync(g_ws.accum, 0, accum_bytes, stream));
     };
-    if (profile) memset_ms = measure_stream_op(stream, launch_memset);
-    else launch_memset();
+    if (N <= 4) {
+        memset_ms = 0.0;
+    } else if (profile) {
+        memset_ms = measure_stream_op(stream, launch_memset);
+    } else {
+        launch_memset();
+    }
 
     int total = M * N;
     int blocks = (total + kThreads - 1) / kThreads;
     int32_t alpha = 1;
     int32_t beta = 0;
+
+    if (N == 1) {
+        auto launch_native_matvec = [&] {
+            int8_matvec_dequant_kernel<<<M, kThreads, 0, stream>>>(
+                W, scale, g_ws.x_scale, g_ws.x_q, Y, M, K, groups, group_size);
+        };
+        if (profile) gemm_ms = measure_stream_op(stream, launch_native_matvec);
+        else launch_native_matvec();
+
+        if (profile) {
+            record_profile(M, N, K, group_size, groups, act_scale != nullptr, smooth_inv != nullptr,
+                           quant_ms, memset_ms, gemm_ms, accum_ms, cast_ms);
+        }
+        return;
+    }
+
+    if (N <= 4) {
+        auto launch_smallbatch = [&] {
+            dim3 grid(M, N);
+            int8_smallbatch_dequant_kernel<<<grid, kThreads, 0, stream>>>(
+                W, scale, g_ws.x_scale, g_ws.x_q, Y, M, N, K, groups, group_size);
+        };
+        if (profile) gemm_ms = measure_stream_op(stream, launch_smallbatch);
+        else launch_smallbatch();
+
+        if (profile) {
+            record_profile(M, N, K, group_size, groups, act_scale != nullptr, smooth_inv != nullptr,
+                           quant_ms, memset_ms, gemm_ms, accum_ms, cast_ms);
+        }
+        return;
+    }
 
     for (int g = 0; g < groups; ++g) {
         int start = g * group_size;

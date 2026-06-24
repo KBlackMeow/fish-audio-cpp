@@ -71,6 +71,10 @@ public:
     void fast_codebook_decode(const __half* fast_hidden, __half* codebook_hidden,
                               __half* logits, int batch_size, int codebook_step,
                               int32_t prev_token = 0, bool compute_logits = true);
+    void fast_codebook_decode_device(const __half* fast_hidden, __half* codebook_hidden,
+                                     __half* logits, int batch_size, int codebook_step,
+                                     const int32_t* prev_token_device,
+                                     bool compute_logits = true);
 
 private:
     struct QuantMeta {

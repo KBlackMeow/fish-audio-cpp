@@ -32,6 +32,22 @@ void rope_qk(
     cudaStream_t stream = 0
 );
 
+// Fast decoder specialization for B=1, T=1: split fused QKV, apply RoPE to
+// Q/K, and scatter K/V directly into the current layer cache slot.
+void fast_qkv_split_rope_cache(
+    const __half* qkv,       // [n_q*D + 2*n_kv*D]
+    __half* q_out,           // [n_q, D]
+    __half* k_cache_layer,   // [n_kv, max_len, D]
+    __half* v_cache_layer,   // [n_kv, max_len, D]
+    const float* freqs,      // [D/2]
+    int n_q,
+    int n_kv,
+    int head_dim,
+    int position,
+    int max_len,
+    cudaStream_t stream = 0
+);
+
 // PagedAttention decode for single query per batch element
 // Each CUDA block processes one (batch, head) pair
 void paged_attention_decode(

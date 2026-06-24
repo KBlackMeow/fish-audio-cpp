@@ -9,7 +9,7 @@ TEXT="${TEXT:-Hello world, this is a short W8A8 profiling run.}"
 MAX_TOKENS="${MAX_TOKENS:-32}"
 SEED="${SEED:-42}"
 MODEL_FP16="${MODEL_FP16:-$ROOT_DIR/checkpoints/s2-pro}"
-MODEL_INT8_G64="${MODEL_INT8_G64:-$ROOT_DIR/models/s2-pro-int8-w8a8}"
+MODEL_INT8_DEFAULT="${MODEL_INT8_DEFAULT:-$ROOT_DIR/models/s2-pro-int8-w8a8-g256}"
 MODEL_INT8_G256="${MODEL_INT8_G256:-$ROOT_DIR/models/s2-pro-int8-w8a8-g256}"
 
 mkdir -p "$OUTPUT_DIR"
@@ -17,7 +17,7 @@ mkdir -p "$OUTPUT_DIR"
 check() { [[ -e "$1" ]] || { echo "MISSING: $1"; exit 1; }; }
 check "$BIN"
 check "$MODEL_FP16/tokenizer.json"
-check "$MODEL_INT8_G64/dual_ar.bin"
+check "$MODEL_INT8_DEFAULT/dual_ar.bin"
 
 run_case() {
   local tag="$1"
@@ -43,10 +43,14 @@ run_case() {
 }
 
 run_case "fp16" "$MODEL_FP16" fp16 0
-run_case "int8_g64" "$MODEL_INT8_G64" int8 1
+run_case "int8_default" "$MODEL_INT8_DEFAULT" int8 1
 
 if [[ -e "$MODEL_INT8_G256/dual_ar.bin" ]]; then
-  run_case "int8_g256" "$MODEL_INT8_G256" int8 1
+  if [[ "$(readlink -f "$MODEL_INT8_DEFAULT/dual_ar.bin")" != "$(readlink -f "$MODEL_INT8_G256/dual_ar.bin")" ]]; then
+    run_case "int8_g256" "$MODEL_INT8_G256" int8 1
+  else
+    echo "SKIP int8_g256: same dual_ar target as default W8A8"
+  fi
 else
   echo "SKIP int8_g256: $MODEL_INT8_G256/dual_ar.bin not found"
 fi

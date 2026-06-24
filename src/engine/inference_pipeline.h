@@ -17,6 +17,13 @@ struct TTSProfiling {
     double tokenize_ms = 0.0;
     double prefill_ms = 0.0;
     double ar_decode_ms = 0.0;
+    double decode_embed_ms = 0.0;
+    double decode_step_ms = 0.0;
+    double decode_logits_ms = 0.0;
+    double semantic_sample_ms = 0.0;
+    double codebook_decode_ms = 0.0;
+    double codebook_sample_ms = 0.0;
+    double seq_update_ms = 0.0;
     double dac_decode_ms = 0.0;
     double audio_copy_ms = 0.0;
     double first_audio_ms = 0.0;
