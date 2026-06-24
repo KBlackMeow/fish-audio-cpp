@@ -96,7 +96,7 @@ bool starts_with_speaker_tag(std::string_view text, std::size_t pos) {
 }
 
 bool is_utf8_punctuation_at(std::string_view text, std::size_t pos, std::size_t* punct_len) {
-    static const char* kPuncts[] = {"。", "！", "？", "，", "；", "：", "、"};
+    static const char* kPuncts[] = {"。", "！", "？"};
     for (const char* punct : kPuncts) {
         const std::size_t len = std::char_traits<char>::length(punct);
         if (pos + len <= text.size() && text.substr(pos, len) == punct) {
@@ -134,8 +134,7 @@ std::vector<std::string> split_text_units(const std::string& text) {
         const unsigned char c = static_cast<unsigned char>(text[i]);
         std::size_t punct_len = 0;
         const bool sentence_break =
-            c == '\n' || c == '.' || c == '!' || c == '?' || c == ';' ||
-            c == ',' || c == ':' ||
+            c == '\n' || c == '.' || c == '!' || c == '?' ||
             is_utf8_punctuation_at(view, i, &punct_len);
         if (!sentence_break) {
             ++i;
@@ -159,99 +158,17 @@ std::vector<std::string> split_text_units(const std::string& text) {
 }
 
 std::vector<std::string> split_text_chunks(const std::string& text, int chunk_length) {
-    if (chunk_length <= 0 || static_cast<int>(text.size()) <= chunk_length) {
+    // chunk_length <= 0:  no chunking — return full text as single chunk
+    // chunk_length >  0:  split by sentence boundaries
+    if (chunk_length <= 0) {
         return {text};
     }
 
     std::vector<std::string> units = split_text_units(text);
-    std::vector<std::string> chunks;
-    std::string current;
-    int current_bytes = 0;
-    int speaker_count = 0;
-
-    auto flush_current = [&]() {
-        if (!current.empty()) {
-            chunks.push_back(current);
-            current.clear();
-            current_bytes = 0;
-            speaker_count = 0;
-        }
-    };
-
-    auto merge_short_chunks = [&](std::vector<std::string>& out) {
-        if (out.size() < 2 || chunk_length <= 0) return;
-        const int short_tail_threshold = std::max(12, chunk_length / 3);
-        bool changed = true;
-        while (changed && out.size() >= 2) {
-            changed = false;
-            for (std::size_t i = 0; i < out.size(); ++i) {
-                const int cur_bytes = static_cast<int>(out[i].size());
-                if (cur_bytes > short_tail_threshold) continue;
-
-                if (i + 1 < out.size()) {
-                    const int merged_next =
-                        cur_bytes + 1 + static_cast<int>(out[i + 1].size());
-                    if (merged_next <= chunk_length + short_tail_threshold) {
-                        out[i + 1] = out[i] + "\n" + out[i + 1];
-                        out.erase(out.begin() + static_cast<std::ptrdiff_t>(i));
-                        changed = true;
-                        break;
-                    }
-                }
-
-                if (i > 0) {
-                    const int merged_prev =
-                        static_cast<int>(out[i - 1].size()) + 1 + cur_bytes;
-                    if (merged_prev <= chunk_length + short_tail_threshold) {
-                        out[i - 1].append("\n").append(out[i]);
-                        out.erase(out.begin() + static_cast<std::ptrdiff_t>(i));
-                        changed = true;
-                        break;
-                    }
-                }
-            }
-        }
-    };
-
-    for (const std::string& unit : units) {
-        int unit_bytes = static_cast<int>(unit.size());
-        bool unit_has_speaker = unit.find("<|speaker:") != std::string::npos;
-        bool exceeds_speakers = unit_has_speaker && speaker_count >= 5 && !current.empty();
-        bool exceeds_bytes = current_bytes + unit_bytes > chunk_length && !current.empty();
-
-        if (exceeds_speakers || exceeds_bytes) {
-            flush_current();
-        }
-
-        if (unit_bytes > chunk_length) {
-            std::size_t pos = 0;
-            while (pos < unit.size()) {
-                std::string_view rest(unit.data() + pos, unit.size() - pos);
-                std::size_t take = utf8_prefix_len(rest, static_cast<std::size_t>(chunk_length));
-                std::size_t split = take;
-                for (std::size_t i = take; i > 0; --i) {
-                    const char ch = rest[i - 1];
-                    if (ch == ' ' || ch == '\n' || ch == '\t' ||
-                        ch == ',' || ch == '.' || ch == '!' || ch == '?' || ch == ';') {
-                        split = i;
-                        break;
-                    }
-                }
-                chunks.emplace_back(trim_ascii(rest.substr(0, split)));
-                pos += split;
-            }
-            continue;
-        }
-
-        if (!current.empty()) current.push_back('\n');
-        current += unit;
-        current_bytes += unit_bytes;
-        if (unit_has_speaker) ++speaker_count;
+    if (units.size() <= 1) {
+        return {text};
     }
-
-    flush_current();
-    merge_short_chunks(chunks);
-    return chunks;
+    return units;
 }
 
 void append_ids(std::vector<int32_t>& out, const std::vector<int>& ids) {
@@ -1287,21 +1204,29 @@ TTSOutput InferencePipeline::run_with_ref_audio_streaming(
     int prev_chunk_frames = 0;
 
     for (std::size_t chunk_idx = 0; chunk_idx < text_chunks.size(); ++chunk_idx) {
+        // Rebuild prompt from scratch each chunk to bound KV cache growth.
+        // Chunk 0: system + ref text/codes + text[0] + assistant
+        // Chunk k>0: same base + history codes from prev chunk + text[k] + assistant
         if (chunk_idx > 0) {
+            rows.assign(cb_dim, std::vector<int32_t>());
+            append_text_segment(rows, tokenizer_->encode_raw(
+                "<|im_start|>system\n"
+                "convert the provided text to speech reference to the following:\n\n"
+                "Text:\n"));
+            append_text_segment(rows, tokenizer_->encode_raw(
+                "<|speaker:0|>" + ref_text + "\n\nSpeech:\n"));
+            append_code_segment(rows, ref_codes, num_codebooks, code_len, sem_begin);
+            append_text_segment(rows, tokenizer_->encode_raw("<|im_end|>\n<|im_start|>user\n"));
+            append_text_segment(rows, tokenizer_->encode_raw(text_chunks.front()));
+            append_text_segment(rows, tokenizer_->encode_raw("<|im_end|>\n<|im_start|>assistant\n<|voice|>"));
+
+            // Stitch: append tail of previous chunk's generated codes as continuation
             std::vector<int32_t> history_codes = tail_code_frames(
-                prev_chunk_codes,
-                num_codebooks,
-                prev_chunk_frames,
-                history_frames);
+                prev_chunk_codes, num_codebooks, prev_chunk_frames, history_frames);
             const int history_len = history_frames > 0
                 ? std::min(prev_chunk_frames, history_frames)
                 : prev_chunk_frames;
-            append_code_segment(
-                rows,
-                history_codes,
-                num_codebooks,
-                history_len,
-                sem_begin);
+            append_code_segment(rows, history_codes, num_codebooks, history_len, sem_begin);
             append_text_segment(rows, tokenizer_->encode_raw("<|im_end|>\n<|im_start|>user\n"));
             append_text_segment(rows, tokenizer_->encode_raw(text_chunks[chunk_idx]));
             append_text_segment(rows, tokenizer_->encode_raw("<|im_end|>\n<|im_start|>assistant\n<|voice|>"));
