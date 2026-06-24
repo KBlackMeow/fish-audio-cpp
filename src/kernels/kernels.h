@@ -81,6 +81,32 @@ void ras_sample(
     cudaStream_t stream = 0
 );
 
+void semantic_history_update(
+    int32_t* previous_tokens,      // [B, 5, win_size], updates semantic row only
+    const int32_t* next_token,     // [B]
+    int batch_size,
+    int win_size,
+    cudaStream_t stream = 0
+);
+
+void semantic_to_codebook0(
+    const int32_t* semantic_token, // [B]
+    int32_t* codebook0,            // [B]
+    int semantic_begin_id,
+    int codebook_size,
+    int batch_size,
+    cudaStream_t stream = 0
+);
+
+void pack_semantic_codebooks(
+    const int32_t* semantic_token, // [B]
+    const int32_t* codebook_tokens,// [B, num_codebooks]
+    int32_t* packed,               // [B, 1 + num_codebooks]
+    int num_codebooks,
+    int batch_size,
+    cudaStream_t stream = 0
+);
+
 // SiLU activation: x = x * sigmoid(x)  (in-place)
 void silu_forward(
     __half* x,
@@ -240,6 +266,21 @@ void embedding_lookup(
     int n_tokens,
     int dim,
     int vocab_size,
+    cudaStream_t stream = 0
+);
+
+void decode_embedding_lookup(
+    const int32_t* semantic_token,     // [B]
+    const int32_t* codebook_tokens,    // [B, num_codebooks]
+    const __half* text_table,          // [vocab_size, dim]
+    const __half* codebook_table,      // [num_codebooks * codebook_size, dim]
+    __half* output,                    // [B, dim]
+    int batch_size,
+    int dim,
+    int vocab_size,
+    int num_codebooks,
+    int codebook_size,
+    float scale,
     cudaStream_t stream = 0
 );
 

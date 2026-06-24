@@ -94,17 +94,63 @@ __global__ void sampling_range_kernel(
     uint64_t seed
 ) {
     int b = blockIdx.x;
+    int tid = threadIdx.x;
+    const int actual_k = min(max(top_k, 1), vocab_size);
     extern __shared__ unsigned char smem[];
-    float* s_logits = reinterpret_cast<float*>(smem);
-    int* s_indices = reinterpret_cast<int*>(s_logits + vocab_size);
+    float* top_vals = reinterpret_cast<float*>(smem);
+    int* top_ids = reinterpret_cast<int*>(top_vals + actual_k);
+    float* thread_vals = reinterpret_cast<float*>(top_ids + actual_k);
+    int* thread_ids = reinterpret_cast<int*>(thread_vals + blockDim.x);
 
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < vocab_size; ++i) {
-            s_logits[i] = __half2float(logits[b * total_vocab_size + id_start + i]);
-            s_indices[i] = id_start + i;
+    if (tid < actual_k) {
+        top_vals[tid] = -1e30f;
+        top_ids[tid] = -1;
+    }
+    __syncthreads();
+
+    for (int sel = 0; sel < actual_k; ++sel) {
+        float local_best = -1e30f;
+        int local_idx = -1;
+        for (int i = tid; i < vocab_size; i += blockDim.x) {
+            int abs_idx = id_start + i;
+            bool chosen = false;
+            for (int j = 0; j < sel; ++j) {
+                if (top_ids[j] == abs_idx) {
+                    chosen = true;
+                    break;
+                }
+            }
+            if (chosen) continue;
+            float v = __half2float(logits[b * total_vocab_size + abs_idx]);
+            if (v > local_best) {
+                local_best = v;
+                local_idx = abs_idx;
+            }
         }
+        thread_vals[tid] = local_best;
+        thread_ids[tid] = local_idx;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                if (thread_vals[tid + stride] > thread_vals[tid]) {
+                    thread_vals[tid] = thread_vals[tid + stride];
+                    thread_ids[tid] = thread_ids[tid + stride];
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            top_vals[sel] = thread_vals[0];
+            top_ids[sel] = thread_ids[0];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
         out_tokens[b] = top_k_top_p_sample_sorted(
-            s_logits, s_indices, vocab_size, temperature, top_p, top_k, seed + b);
+            top_vals, top_ids, actual_k, temperature, top_p, actual_k, seed + b);
     }
 }
 
@@ -121,20 +167,64 @@ __global__ void sampling_semantic_eos_kernel(
     uint64_t seed
 ) {
     int b = blockIdx.x;
+    int tid = threadIdx.x;
     const int sz = semantic_size + 1;
+    const int actual_k = min(max(top_k, 1), sz);
     extern __shared__ unsigned char smem[];
-    float* s_logits = reinterpret_cast<float*>(smem);
-    int* s_indices = reinterpret_cast<int*>(s_logits + sz);
+    float* top_vals = reinterpret_cast<float*>(smem);
+    int* top_ids = reinterpret_cast<int*>(top_vals + actual_k);
+    float* thread_vals = reinterpret_cast<float*>(top_ids + actual_k);
+    int* thread_ids = reinterpret_cast<int*>(thread_vals + blockDim.x);
 
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < semantic_size; ++i) {
-            s_logits[i] = __half2float(logits[b * total_vocab_size + semantic_start + i]);
-            s_indices[i] = semantic_start + i;
+    if (tid < actual_k) {
+        top_vals[tid] = -1e30f;
+        top_ids[tid] = -1;
+    }
+    __syncthreads();
+
+    for (int sel = 0; sel < actual_k; ++sel) {
+        float local_best = -1e30f;
+        int local_idx = -1;
+        for (int i = tid; i < sz; i += blockDim.x) {
+            int abs_idx = (i == semantic_size) ? eos_id : (semantic_start + i);
+            bool chosen = false;
+            for (int j = 0; j < sel; ++j) {
+                if (top_ids[j] == abs_idx) {
+                    chosen = true;
+                    break;
+                }
+            }
+            if (chosen) continue;
+            float v = __half2float(logits[b * total_vocab_size + abs_idx]);
+            if (v > local_best) {
+                local_best = v;
+                local_idx = abs_idx;
+            }
         }
-        s_logits[semantic_size] = __half2float(logits[b * total_vocab_size + eos_id]);
-        s_indices[semantic_size] = eos_id;
+        thread_vals[tid] = local_best;
+        thread_ids[tid] = local_idx;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                if (thread_vals[tid + stride] > thread_vals[tid]) {
+                    thread_vals[tid] = thread_vals[tid + stride];
+                    thread_ids[tid] = thread_ids[tid + stride];
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            top_vals[sel] = thread_vals[0];
+            top_ids[sel] = thread_ids[0];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
         out_tokens[b] = top_k_top_p_sample_sorted(
-            s_logits, s_indices, sz, temperature, top_p, top_k, seed + b);
+            top_vals, top_ids, actual_k, temperature, top_p, actual_k, seed + b);
     }
 }
 
@@ -290,8 +380,10 @@ void sample_top_k_top_p_range(
     cudaStream_t stream
 ) {
     if (vocab_size <= 0) return;
-    const int shmem = vocab_size * (sizeof(float) + sizeof(int));
-    sampling_range_kernel<<<batch_size, 1, shmem, stream>>>(
+    const int threads = 256;
+    const int actual_k = min(max(top_k, 1), vocab_size);
+    const int shmem = (actual_k + threads) * (sizeof(float) + sizeof(int));
+    sampling_range_kernel<<<batch_size, threads, shmem, stream>>>(
         logits, out_tokens, total_vocab_size, id_start, vocab_size,
         temperature, top_p, top_k, seed);
     CUDA_CHECK(cudaGetLastError());
@@ -313,8 +405,10 @@ void sample_top_k_top_p_semantic_eos(
 ) {
     const int sz = semantic_size + 1;
     if (sz <= 0) return;
-    const int shmem = sz * (sizeof(float) + sizeof(int));
-    sampling_semantic_eos_kernel<<<batch_size, 1, shmem, stream>>>(
+    const int threads = 256;
+    const int actual_k = min(max(top_k, 1), sz);
+    const int shmem = (actual_k + threads) * (sizeof(float) + sizeof(int));
+    sampling_semantic_eos_kernel<<<batch_size, threads, shmem, stream>>>(
         logits, out_tokens, total_vocab_size, semantic_start, semantic_size, eos_id,
         temperature, top_p, top_k, seed);
     CUDA_CHECK(cudaGetLastError());

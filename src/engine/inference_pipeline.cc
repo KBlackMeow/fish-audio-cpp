@@ -516,6 +516,13 @@ TTSOutput InferencePipeline::run_streaming(
     int im_end_id = tokenizer_->im_end_id();
     std::vector<int32_t> generated;
     IncrementalAudioStreamer audio_streamer(dac_.get(), num_codebooks, &profiling);
+    int sem_start = dual_ar_->config().semantic_begin_id;  // 151678
+    int sem_end   = dual_ar_->config().semantic_end_id;    // 155773
+    int eos_id    = dual_ar_->config().im_end_token_id;    // 151645
+    int sem_range = sem_end - sem_start + 1;
+    static constexpr int RAS_WIN_SIZE = 10;
+    static constexpr float RAS_HIGH_TEMP = 1.0f;
+    static constexpr float RAS_HIGH_TOP_P = 0.9f;
 
     // Pre-allocate logits and token buffers on GPU
     __half* d_logits;
@@ -523,14 +530,27 @@ TTSOutput InferencePipeline::run_streaming(
     __half* d_codebook_logits;
     __half* d_embed;  // combined embedding for each decode step
     int32_t* d_codebook_tokens;
+    int32_t* d_codebook_tokens_next;
+    int32_t* d_sem_current;
+    int32_t* d_sem_next;
+    int32_t* d_sem_high;
+    int32_t* d_sem_history;
+    int32_t* d_generated_tokens;
     CUDA_CHECK(cudaMalloc(&d_logits,          vocab_size * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_tokens,           2 * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&d_codebook_logits,
                           dual_ar_->config().codebook_size * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_embed,            dim * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_codebook_tokens,  num_codebooks * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_codebook_tokens_next, num_codebooks * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sem_current,      sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sem_next,         sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sem_high,         sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sem_history,      5 * RAS_WIN_SIZE * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_generated_tokens,
+                          static_cast<size_t>(max_new_tokens) * (1 + num_codebooks) * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemsetAsync(d_sem_history, 0xff, 5 * RAS_WIN_SIZE * sizeof(int32_t), stream));
     int32_t h_sample_token = 0;
-    int32_t h_high_sample_token = 0;
 
     auto sample_range = [&](int sz, int id_start, float temp, float tp, int tk, uint64_t rng) -> int32_t {
         const auto sample_start = Clock::now();
@@ -551,11 +571,14 @@ TTSOutput InferencePipeline::run_streaming(
         profiling.codebook_sample_ms += elapsed_ms(sample_start);
     };
 
-    // Semantic sampling: allow [sem_start, sem_end] + eos_token
-    int sem_start = dual_ar_->config().semantic_begin_id;  // 151678
-    int sem_end   = dual_ar_->config().semantic_end_id;    // 155773
-    int eos_id    = dual_ar_->config().im_end_token_id;    // 151645
-    int sem_range = sem_end - sem_start + 1;
+    auto sample_semantic_device = [&](int32_t* out_token, float temp, float tp, int tk, uint64_t rng) {
+        const auto sample_start = Clock::now();
+        kernels::sample_top_k_top_p_semantic_eos(
+            d_logits, out_token, 1, vocab_size, sem_start, sem_range, eos_id,
+            temp, tp, tk, rng, stream);
+        profiling.semantic_sample_ms += elapsed_ms(sample_start);
+    };
+
     std::vector<__half> h_logits_fp16;
 
     auto sample_semantic = [&](float temp, float tp, int tk, uint64_t rng) -> int32_t {
@@ -609,50 +632,30 @@ TTSOutput InferencePipeline::run_streaming(
     }
 
     {
-    // ---- Generate frame-0 codebooks from the PREFILL hidden state ----
-    // Python flow (decode_one_token_ar):
-    //   cb[0] = clamp(sem - sem_begin, 0, cb_size-1)  -- deterministic
-    //   cb[1..N-1] = sample(fast_decoder_logits)       -- full range, no clamp
     int cb_size  = dual_ar_->config().codebook_size;
     int sem_begin = dual_ar_->config().semantic_begin_id;
+    CUDA_CHECK(cudaMemcpyAsync(d_sem_current, &sem, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_sem_history, &sem, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    auto gen_codebooks = [&](int32_t cur_sem, uint64_t base_rng,
-                             std::vector<int32_t>& out_cbs,
-                             float cb_temp, float cb_top_p, int cb_top_k) {
+    auto gen_codebooks_device_sem = [&](const int32_t* d_sem_token, int32_t* d_cb_out,
+                                        uint64_t base_rng,
+                                        float cb_temp, float cb_top_p, int cb_top_k) {
         const auto cb_start = Clock::now();
-        out_cbs.resize(num_codebooks);
-        // position 0: populate fast KV cache (logits discarded in Python too)
+        kernels::semantic_to_codebook0(
+            d_sem_token, d_cb_out, sem_begin, cb_size, 1, stream);
         dual_ar_->fast_codebook_decode(d_hidden, nullptr, d_codebook_logits,
                                        1, 0, 0, false);
-        // cb[0] = deterministic: clamp(sem - sem_begin, 0, cb_size-1)
-        out_cbs[0] = std::max(0, std::min(cb_size - 1, cur_sem - sem_begin));
-        CUDA_CHECK(cudaMemcpyAsync(d_codebook_tokens, out_cbs.data(),
-                                   sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        // cb[1..num_codebooks-1]: sample from fast decoder with FULL logits
-        // (Python does NOT clamp to acoustic range — model learns to avoid invalid codes)
         for (int cb = 1; cb < num_codebooks; cb++) {
             dual_ar_->fast_codebook_decode_device(d_hidden, nullptr, d_codebook_logits,
-                                                  1, cb, d_codebook_tokens + (cb - 1));
-            // Sample from full [0, cb_size) range (matches Python), using pipeline params
-            sample_range_device(d_codebook_tokens + cb, cb_size, 0,
+                                                  1, cb, d_cb_out + (cb - 1));
+            sample_range_device(d_cb_out + cb, cb_size, 0,
                                 cb_temp, cb_top_p, cb_top_k, base_rng + cb);
         }
-        CUDA_CHECK(cudaMemcpy(out_cbs.data(), d_codebook_tokens,
-                              num_codebooks * sizeof(int32_t), cudaMemcpyDeviceToHost));
         profiling.codebook_decode_ms += elapsed_ms(cb_start);
     };
 
-    std::vector<int32_t> curr_cbs;
-    gen_codebooks(sem, static_cast<uint64_t>(seed), curr_cbs, temperature, top_p, top_k);
-
-    // ---- RAS (Repetition Aware Sampling) state ----
-    // Python: previous_tokens shape [num_codebooks+1, RAS_WIN_SIZE]
-    // RAS only checks row-0 (semantic tokens) for repetition, so a ring buffer suffices.
-    static constexpr int RAS_WIN_SIZE = 10;
-    static constexpr float RAS_HIGH_TEMP = 1.0f;
-    static constexpr float RAS_HIGH_TOP_P = 0.9f;
-    std::vector<int32_t> sem_history(RAS_WIN_SIZE, -1);
-    sem_history[0] = sem;  // first semantic token enters history
+    gen_codebooks_device_sem(d_sem_current, d_codebook_tokens,
+                             static_cast<uint64_t>(seed), temperature, top_p, top_k);
 
     // ---- Autoregressive loop ----
     // Python flow at each step k:
@@ -661,10 +664,11 @@ TTSOutput InferencePipeline::run_streaming(
     //   3. fast_decoder(hidden) → cbs_{k+1}
     //   4. record frame k = [sem_k, cbs_k]
     const auto ar_decode_start = Clock::now();
+    int generated_steps = 0;
     for (int step = 0; step < max_new_tokens; step++) {
         // 1. Embed [sem, cbs] for THIS frame (same step)
         const auto embed_start = Clock::now();
-        dual_ar_->embed_for_decode(sem, curr_cbs.data(), d_embed, stream);
+        dual_ar_->embed_for_decode_device(d_sem_current, d_codebook_tokens, d_embed, stream);
         profiling.decode_embed_ms += elapsed_ms(embed_start);
 
         // seq_len must include the current position being written (prompt_len + step),
@@ -689,37 +693,25 @@ TTSOutput InferencePipeline::run_streaming(
             dual_ar_->get_logits(d_hidden, d_logits, 1);
             profiling.decode_logits_ms += elapsed_ms(logits_start);
         }
-        int32_t sem_normal = sample_semantic(temperature, top_p, top_k,
-                                              static_cast<uint64_t>(seed) + step + 1);
-        // RAS: if sem_normal is in semantic range AND appeared in recent history, use high-temp fallback
-        bool is_semantic = (sem_normal >= sem_start && sem_normal <= sem_end);
-        bool in_window = false;
-        if (is_semantic) {
-            for (int w = 0; w < RAS_WIN_SIZE; w++) {
-                if (sem_history[w] == sem_normal) { in_window = true; break; }
-            }
-        }
-        int32_t sem_high = sem_normal;
-        if (is_semantic && in_window) {
-            const auto sample_start = Clock::now();
-            kernels::sample_top_k_top_p_semantic_eos(
-                d_logits, d_tokens + 1, 1, vocab_size, sem_start, sem_range, eos_id,
-                RAS_HIGH_TEMP, RAS_HIGH_TOP_P, top_k,
-                static_cast<uint64_t>(seed) + step + 1 + 1000000, stream);
-            CUDA_CHECK(cudaMemcpy(&h_high_sample_token, d_tokens + 1, sizeof(int32_t), cudaMemcpyDeviceToHost));
-            sem_high = h_high_sample_token;
-            profiling.semantic_sample_ms += elapsed_ms(sample_start);
-        }
-        int32_t next_sem = (is_semantic && in_window) ? sem_high : sem_normal;
+        sample_semantic_device(d_sem_next, temperature, top_p, top_k,
+                               static_cast<uint64_t>(seed) + step + 1);
+        sample_semantic_device(d_sem_high, RAS_HIGH_TEMP, RAS_HIGH_TOP_P, top_k,
+                               static_cast<uint64_t>(seed) + step + 1 + 1000000);
+        kernels::ras_sample(d_sem_next, d_sem_high, d_sem_history,
+                            sem_start, sem_end, 1, RAS_WIN_SIZE, stream);
 
         // 4. Generate NEXT frame's codebooks from this hidden state
-        std::vector<int32_t> next_cbs;
-        gen_codebooks(next_sem, static_cast<uint64_t>(seed) + (step + 1) * num_codebooks,
-                      next_cbs, temperature, top_p, top_k);
-
-        // 5. Record current frame
-        generated.push_back(sem);
-        for (auto c : curr_cbs) generated.push_back(c);
+        gen_codebooks_device_sem(d_sem_next, d_codebook_tokens_next,
+                                 static_cast<uint64_t>(seed) + (step + 1) * num_codebooks,
+                                 temperature, top_p, top_k);
+        kernels::pack_semantic_codebooks(
+            d_sem_current, d_codebook_tokens,
+            d_generated_tokens + static_cast<size_t>(step) * (1 + num_codebooks),
+            num_codebooks, 1, stream);
+        kernels::semantic_history_update(d_sem_history, d_sem_next, 1, RAS_WIN_SIZE, stream);
+        CUDA_CHECK(cudaMemcpy(&h_sample_token, d_sem_next, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        int32_t next_sem = h_sample_token;
+        generated_steps += 1;
 
         // Streaming: report progress (audio chunks are sent after full DAC decode)
         if (callback.on_progress) {
@@ -728,22 +720,21 @@ TTSOutput InferencePipeline::run_streaming(
 
         // Diagnostic: log first 5 semantic tokens + codebook ranges
         if (debug_inference && step < 5) {
-            spdlog::info("  step={} sem={} (normal={} high={}) cb0={} cb1={} cb_last={}",
-                         step, sem, sem_normal, sem_high, curr_cbs[0], curr_cbs[1],
-                         curr_cbs[num_codebooks - 1]);
+            spdlog::info("  step={} sem={} next_sem={}", step, sem, next_sem);
         }
-
-        // Roll RAS history left, insert next semantic token at end
-        for (int w = 0; w < RAS_WIN_SIZE - 1; w++)
-            sem_history[w] = sem_history[w + 1];
-        sem_history[RAS_WIN_SIZE - 1] = next_sem;
 
         // Advance
         sem = next_sem;
-        curr_cbs = std::move(next_cbs);
+        std::swap(d_sem_current, d_sem_next);
+        std::swap(d_codebook_tokens, d_codebook_tokens_next);
         if (sem == eos_id) break;
     }
     profiling.ar_decode_ms = elapsed_ms(ar_decode_start);
+    generated.resize(static_cast<size_t>(generated_steps) * (1 + num_codebooks));
+    if (!generated.empty()) {
+        CUDA_CHECK(cudaMemcpy(generated.data(), d_generated_tokens,
+                              generated.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    }
     }
     decode_done:
 
@@ -766,6 +757,12 @@ TTSOutput InferencePipeline::run_streaming(
         CUDA_CHECK(cudaFree(d_codebook_logits));
         CUDA_CHECK(cudaFree(d_embed));
         CUDA_CHECK(cudaFree(d_codebook_tokens));
+        CUDA_CHECK(cudaFree(d_codebook_tokens_next));
+        CUDA_CHECK(cudaFree(d_sem_current));
+        CUDA_CHECK(cudaFree(d_sem_next));
+        CUDA_CHECK(cudaFree(d_sem_high));
+        CUDA_CHECK(cudaFree(d_sem_history));
+        CUDA_CHECK(cudaFree(d_generated_tokens));
         profiling.total_ms = elapsed_ms(total_start);
         log_profiling_summary(profiling);
         return {std::vector<float>(), std::vector<int32_t>(), dac_->config().sample_rate, profiling};
@@ -830,6 +827,12 @@ TTSOutput InferencePipeline::run_streaming(
     CUDA_CHECK(cudaFree(d_codebook_logits));
     CUDA_CHECK(cudaFree(d_embed));
     CUDA_CHECK(cudaFree(d_codebook_tokens));
+    CUDA_CHECK(cudaFree(d_codebook_tokens_next));
+    CUDA_CHECK(cudaFree(d_sem_current));
+    CUDA_CHECK(cudaFree(d_sem_next));
+    CUDA_CHECK(cudaFree(d_sem_high));
+    CUDA_CHECK(cudaFree(d_sem_history));
+    CUDA_CHECK(cudaFree(d_generated_tokens));
     profiling.total_ms = elapsed_ms(total_start);
     audio_result.profiling = profiling;
     log_profiling_summary(audio_result.profiling);

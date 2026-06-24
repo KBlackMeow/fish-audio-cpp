@@ -722,6 +722,26 @@ void DualAREngine::embed_for_decode(int32_t semantic_token, const int32_t* codeb
     kernels::scale_inplace(out, dim, scale, stream);
 }
 
+void DualAREngine::embed_for_decode_device(const int32_t* semantic_token,
+                                           const int32_t* codebook_tokens,
+                                           __half* out, cudaStream_t stream)
+{
+    float scale = 1.0f / std::sqrt(float(cfg_.num_codebooks + 1));
+    kernels::decode_embedding_lookup(
+        semantic_token,
+        codebook_tokens,
+        w_embedding_.as<__half>(),
+        w_codebook_embeddings_.as<__half>(),
+        out,
+        1,
+        cfg_.dim,
+        cfg_.vocab_size,
+        cfg_.num_codebooks,
+        cfg_.codebook_size,
+        scale,
+        stream);
+}
+
 // ============================================================================
 // fast_codebook_decode — single codebook step through the fast decoder
 //

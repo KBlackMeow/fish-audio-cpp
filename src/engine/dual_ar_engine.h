@@ -65,6 +65,9 @@ public:
     // codebook_tokens is null (zero out codebook terms) or points to n_codebooks int32_t values
     void embed_for_decode(int32_t semantic_token, const int32_t* codebook_tokens,
                           __half* out, cudaStream_t stream);
+    void embed_for_decode_device(const int32_t* semantic_token,
+                                 const int32_t* codebook_tokens,
+                                 __half* out, cudaStream_t stream);
 
     // fast_hidden : slow-decoder output (used only when codebook_step == 0)
     // prev_token  : token sampled at codebook_step-1 (ignored when step == 0)
