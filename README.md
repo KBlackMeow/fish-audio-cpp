@@ -2,10 +2,14 @@
 
 纯 C++/CUDA 实现的 Fish Audio S2 Pro TTS 推理引擎。支持 CLI 和 HTTP Server，支持参考音频（voice cloning）。
 
+**支持平台：Linux / Windows（CUDA 12.4+）**
+
 ## 目录
 
 - [模型准备](#模型准备)
 - [编译](#编译)
+  - [Linux](#linux)
+  - [Windows](#windows)
 - [CLI 使用](#cli-使用)
 - [HTTP Server](#http-server)
 - [API 接口](#api-接口)
@@ -71,8 +75,9 @@ checkpoints/s2-pro/
 
 推理时使用 `models/<model>-<dtype>/` 目录，通过符号链接指向实际文件：
 
+**Linux：**
+
 ```bash
-# 创建 FP16 模型目录
 mkdir -p models/s2-pro-fp16
 cd models/s2-pro-fp16
 
@@ -84,6 +89,22 @@ ln -s ../../checkpoints/s2-pro/tokenizer.json tokenizer.json
 ln -s ../../checkpoints/s2-pro/tokenizer_config.json tokenizer_config.json
 ln -s ../../checkpoints/s2-pro/special_tokens_map.json special_tokens_map.json
 ```
+
+**Windows（PowerShell，需开发者模式或管理员权限）：**
+
+```powershell
+New-Item -ItemType Directory -Force models\s2-pro-fp16
+cd models\s2-pro-fp16
+cmd /c mklink dual_ar.bin ..\..\checkpoints\s2-pro\dual_ar.bin
+cmd /c mklink dual_ar_config.json ..\..\checkpoints\s2-pro\dual_ar_config.json
+cmd /c mklink dac.bin ..\..\checkpoints\s2-pro\dac.bin
+cmd /c mklink dac_config.json ..\..\checkpoints\s2-pro\dac_config.json
+cmd /c mklink tokenizer.json ..\..\checkpoints\s2-pro\tokenizer.json
+cmd /c mklink tokenizer_config.json ..\..\checkpoints\s2-pro\tokenizer_config.json
+cmd /c mklink special_tokens_map.json ..\..\checkpoints\s2-pro\special_tokens_map.json
+```
+
+> **提示**：也可以直接把文件复制进去（无需权限），`mklink` 只是节省磁盘空间。
 
 目录结构：
 
@@ -143,26 +164,68 @@ ln -s ../../checkpoints/s2-pro/dac_fp16.bin dac.bin          # DAC 保持 FP16
 
 ## 编译
 
-### 依赖
+其余依赖（spdlog, httplib, nlohmann/json, sentencepiece, googletest）通过 CMake FetchContent 自动下载，无需手动安装。
 
-- **CUDA Toolkit ≥ 12.4**
-- **cuDNN**
-- **cmake ≥ 3.24**
-- **GCC ≥ 9**（支持 C++17）
+### Linux
 
-其余依赖（spdlog, httplib, nlohmann/json, sentencepiece, googletest）通过 CMake FetchContent 自动下载。
+**依赖：**
 
-### 编译步骤
+- CUDA Toolkit ≥ 12.4
+- cuDNN
+- CMake ≥ 3.24
+- GCC ≥ 9（C++17）
 
 ```bash
-# 默认 CUDA 架构为 89（RTX 4090）
-# 如需修改，编辑 CMakeLists.txt 中的 CMAKE_CUDA_ARCHITECTURES
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target fish-server -j$(nproc)
 
-# 可选：编译并运行单元测试
+# 可选：单元测试
 cmake --build build --target test_fish -j$(nproc)
 ./build/test_fish
+
+# 全模型测试矩阵（3 种精度 × 4 种场景）
+bash scripts/test_all.sh
+```
+
+### Windows
+
+**依赖：**
+
+- [CUDA Toolkit 12.4+](https://developer.nvidia.com/cuda-downloads)
+- [cuDNN 9.x](https://developer.nvidia.com/cudnn)（解压后放到 `C:\Program Files\NVIDIA\CUDNN\v9.x\`）
+- [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)（选"Desktop development with C++"工作负载）
+- CMake 3.24+
+- PowerShell 5.1+（Windows 内置）
+
+> **注意**：CUDA 12.9 不支持 VS 2026（MSVC 19.51+），必须使用 VS 2022（MSVC 19.4x）。
+
+**一键构建：**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+```
+
+**手动构建：**
+
+```powershell
+$CudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
+cmake -S . -B build_win -DCMAKE_BUILD_TYPE=Release `
+      -DCMAKE_CUDA_ARCHITECTURES=89 `
+      "-T" "v143,cuda=$CudaPath" `
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+cmake --build build_win --config Release --target fish-server -j
+```
+
+可执行文件位于 `build_win\Release\fish-server.exe`。
+
+**全模型测试：**
+
+```powershell
+# 构建 + 测试
+powershell -ExecutionPolicy Bypass -File scripts\test_all.ps1
+
+# 仅测试（跳过编译）
+powershell -ExecutionPolicy Bypass -File scripts\test_all.ps1 -NoBuild
 ```
 
 ### 常用 GPU 的 CUDA 架构号
@@ -190,6 +253,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86"
 
 ### 纯文本合成
 
+**Linux：**
+
 ```bash
 ./build/fish-server \
   --model-dir models/s2-pro-fp16 \
@@ -202,7 +267,21 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86"
   --seed 42
 ```
 
+**Windows（PowerShell）：**
+
+```powershell
+.\build_win\Release\fish-server.exe `
+  --model-dir models\s2-pro-fp16 `
+  --text "今天天气真好，我们出去散步吧。" `
+  --output output\speech.wav `
+  --max-tokens 256 --seed 42
+```
+
+> Windows 下中文直接传参即可，exe 内部使用 `wmain` 从 OS 获取 UTF-16 参数，无需额外设置编码。
+
 ### 参考音频（Voice Cloning）
+
+**Linux：**
 
 ```bash
 ./build/fish-server \
@@ -212,6 +291,17 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86"
   --text "Traveler, shall we go on an adventure today?" \
   --output output/cloned.wav \
   --max-tokens 256
+```
+
+**Windows：**
+
+```powershell
+.\build_win\Release\fish-server.exe `
+  --model-dir models\s2-pro-fp16 `
+  --ref-audio example\vo_LLZAQ001_4_nahida_03.wav `
+  --ref-text example\vo_LLZAQ001_4_nahida_03.lab `
+  --text "Traveler, shall we go on an adventure today?" `
+  --output output\cloned.wav --max-tokens 256
 ```
 
 - `--ref-audio`：参考音频 WAV 文件（任意采样率，内部自动重采样到 44.1kHz）
@@ -478,7 +568,9 @@ fish-audio-cpp/
 │   ├── merge_calibration_dumps.py # 校准数据合并
 │   └── quant_utils.py             # 量化工具函数
 ├── scripts/
-│   ├── test_all.sh                # 全模型测试矩阵
+│   ├── test_all.sh                # 全模型测试矩阵（Linux）
+│   ├── test_all.ps1               # 全模型测试矩阵（Windows PowerShell）
+│   ├── build_windows.ps1          # Windows 一键构建脚本
 │   ├── build_and_test.sh          # CI 构建+测试
 │   └── test_api.py                # Python SSE 流式客户端
 ├── models/                        # 模型目录（符号链接布局）
