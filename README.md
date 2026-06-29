@@ -571,7 +571,7 @@ fish-audio-cpp/
 │   ├── test_all.sh                # 全模型测试矩阵（Linux）
 │   ├── test_all.ps1               # 全模型测试矩阵（Windows PowerShell）
 │   ├── build_windows.ps1          # Windows 一键构建脚本
-│   ├── build_and_test.sh          # CI 构建+测试
+│   ├── build.sh                   # Linux 构建脚本
 │   └── test_api.py                # Python SSE 流式客户端
 ├── models/                        # 模型目录（符号链接布局）
 ├── checkpoints/                   # 原始模型文件（.bin, config, tokenizer）
