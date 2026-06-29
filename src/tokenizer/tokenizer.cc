@@ -9,7 +9,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <unordered_map>
-#include <unistd.h>
+#include <filesystem>
 #include <vector>
 #include <string>
 
@@ -263,7 +263,7 @@ bool Tokenizer::load(const std::string& model_path) {
     model_dir_ = model_path;
 
     std::string json_path = model_path + "/tokenizer.json";
-    if (access(json_path.c_str(), F_OK) == 0) {
+    if (std::filesystem::exists(json_path)) {
         try {
             std::ifstream f(json_path);
             nlohmann::json j;
@@ -330,7 +330,7 @@ bool Tokenizer::load(const std::string& model_path) {
     }
 
     std::string sp_path = model_path + "/tokenizer.model";
-    if (access(sp_path.c_str(), F_OK) == 0) {
+    if (std::filesystem::exists(sp_path)) {
         try {
             sp_impl_ = std::make_unique<Impl>();
             auto status = sp_impl_->sp.Load(sp_path);

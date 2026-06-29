@@ -313,8 +313,9 @@ static std::string build_reference_prompt_file(
         }
     }
 
-    std::filesystem::create_directories("/tmp/fish-audio-cpp");
-    std::string prompt_path = "/tmp/fish-audio-cpp/reference_prompt.bin";
+    auto tmp_dir = std::filesystem::temp_directory_path() / "fish-audio-cpp";
+    std::filesystem::create_directories(tmp_dir);
+    std::string prompt_path = (tmp_dir / "reference_prompt.bin").string();
     std::ofstream pf(prompt_path, std::ios::binary);
     if (!pf.good())
         throw std::runtime_error("Cannot write prompt file: " + prompt_path);
@@ -644,8 +645,9 @@ static int run_main(int argc, char* argv[]) {
         dac->encode(audio_f32.data(), 1, n_samples, ref_cb.data(), &cb_len);
 
         // 4. Write to temp file and build prompt
-        std::filesystem::create_directories("/tmp/fish-audio-cpp");
-        std::string tmp_codes = "/tmp/fish-audio-cpp/ref_auto_codes.bin";
+        auto tmp_dir2 = std::filesystem::temp_directory_path() / "fish-audio-cpp";
+        std::filesystem::create_directories(tmp_dir2);
+        std::string tmp_codes = (tmp_dir2 / "ref_auto_codes.bin").string();
         std::ofstream cf(tmp_codes, std::ios::binary);
         int32_t hdr2[2] = {fish::DAC_TOTAL_CODEBOOKS, cb_len};
         cf.write(reinterpret_cast<const char*>(hdr2), sizeof(hdr2));
@@ -729,6 +731,41 @@ static int run_main(int argc, char* argv[]) {
     return 0;
 }
 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+// On Windows, argv[] uses the system ANSI code page (e.g. GBK on Chinese Windows),
+// not UTF-8, so Chinese text gets garbled. wmain() receives UTF-16 from the OS
+// and we convert to UTF-8 before parsing.
+static std::string wide_to_utf8(const wchar_t* w) {
+    if (!w || !*w) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+int wmain(int argc, wchar_t* wargv[]) {
+    std::vector<std::string> storage(static_cast<size_t>(argc));
+    std::vector<char*> argv_ptrs(static_cast<size_t>(argc));
+    for (int i = 0; i < argc; i++) {
+        storage[static_cast<size_t>(i)] = wide_to_utf8(wargv[i]);
+        argv_ptrs[static_cast<size_t>(i)] = storage[static_cast<size_t>(i)].data();
+    }
+    try {
+        return run_main(argc, argv_ptrs.data());
+    } catch (const std::exception& e) {
+        spdlog::critical("{}", e.what());
+        return 1;
+    }
+}
+#else
 int main(int argc, char* argv[]) {
     try {
         return run_main(argc, argv);
@@ -737,3 +774,4 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 }
+#endif

@@ -1,11 +1,18 @@
 #include "model/loader.h"
 #include <spdlog/spdlog.h>
 #include <cuda_runtime.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <cstring>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
 
 namespace fish {
 
@@ -41,9 +48,41 @@ ModelLoader& ModelLoader::operator=(ModelLoader&& other) noexcept {
 }
 
 bool ModelLoader::load(const std::string& bin_path) {
-    // Release any previously loaded model first
     if (fd_ >= 0) unload();
 
+#ifdef _WIN32
+    HANDLE hFile = CreateFileA(bin_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        spdlog::error("Failed to open model file: {}", bin_path);
+        return false;
+    }
+
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hFile, &fileSize)) {
+        spdlog::error("Failed to get file size: {}", bin_path);
+        CloseHandle(hFile);
+        return false;
+    }
+    mapped_size_ = static_cast<size_t>(fileSize.QuadPart);
+
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!hMap) {
+        spdlog::error("Failed to create file mapping: {}", bin_path);
+        CloseHandle(hFile);
+        return false;
+    }
+
+    mapped_data_ = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);   // mapping handle no longer needed after MapViewOfFile
+    CloseHandle(hFile);
+
+    if (!mapped_data_) {
+        spdlog::error("Failed to map view of file: {}", bin_path);
+        return false;
+    }
+    fd_ = 1;  // mark as loaded (Windows: no fd, use sentinel)
+#else
     fd_ = open(bin_path.c_str(), O_RDONLY);
     if (fd_ < 0) {
         spdlog::error("Failed to open model file: {}", bin_path);
@@ -66,6 +105,7 @@ bool ModelLoader::load(const std::string& bin_path) {
         fd_ = -1;
         return false;
     }
+#endif
 
     // Parse header
     const uint8_t* ptr = static_cast<const uint8_t*>(mapped_data_);
@@ -131,7 +171,7 @@ bool ModelLoader::has(const std::string& name) const {
 }
 
 bool ModelLoader::pin_memory() {
-    if (!mapped_data_ || mapped_data_ == MAP_FAILED) {
+    if (!mapped_data_) {
         spdlog::error("pin_memory: no mapped data");
         return false;
     }
@@ -147,15 +187,16 @@ bool ModelLoader::pin_memory() {
 }
 
 void ModelLoader::unload() {
-    if (mapped_data_ && mapped_data_ != MAP_FAILED) {
-        cudaHostUnregister(const_cast<void*>(mapped_data_));
+    if (mapped_data_) {
+        cudaHostUnregister(mapped_data_);
+#ifdef _WIN32
+        UnmapViewOfFile(mapped_data_);
+#else
         munmap(mapped_data_, mapped_size_);
+#endif
         mapped_data_ = nullptr;
     }
-    if (fd_ >= 0) {
-        close(fd_);
-        fd_ = -1;
-    }
+    fd_ = -1;
     headers_.clear();
     mapped_size_ = 0;
 }

@@ -10,6 +10,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+if(WIN32)
+  add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+  # 告诉 MSVC 源文件是 UTF-8 编码（否则中文字符串字面量会乱码报错）
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:C>:/utf-8>)
+endif()
+
 find_package(CUDAToolkit 12.4 REQUIRED)
 
 # TODO: Uncomment when dev packages are installed
@@ -22,9 +28,33 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 # TODO: Uncomment when FlashAttention headers/libs are available
 # find_package(FlashAttention REQUIRED)
 
-find_library(CUDNN_LIBRARY cudnn PATHS ${CUDAToolkit_LIBRARY_DIR} /usr/lib/x86_64-linux-gnu REQUIRED)
-find_path(CUDNN_INCLUDE_DIR cudnn.h
-  PATHS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/include/x86_64-linux-gnu REQUIRED)
+if(WIN32)
+  find_library(CUDNN_LIBRARY cudnn
+    PATHS
+      ${CUDAToolkit_LIBRARY_DIR}
+      "$ENV{CUDNN_PATH}/lib"
+      "$ENV{CUDNN_PATH}/lib/x64"
+      "C:/Program Files/NVIDIA/CUDNN/v9.23/lib/12.9/x64"
+      "C:/Program Files/NVIDIA/CUDNN/v9.23/lib/13.3/x64"
+      "C:/Program Files/NVIDIA/CUDNN/v9.x/lib/x64"
+      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64"
+      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/lib/x64"
+    REQUIRED)
+  find_path(CUDNN_INCLUDE_DIR cudnn.h
+    PATHS
+      ${CUDAToolkit_INCLUDE_DIRS}
+      "$ENV{CUDNN_PATH}/include"
+      "C:/Program Files/NVIDIA/CUDNN/v9.23/include/12.9"
+      "C:/Program Files/NVIDIA/CUDNN/v9.23/include/13.3"
+      "C:/Program Files/NVIDIA/CUDNN/v9.x/include"
+      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/include"
+      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/include"
+    REQUIRED)
+else()
+  find_library(CUDNN_LIBRARY cudnn PATHS ${CUDAToolkit_LIBRARY_DIR} /usr/lib/x86_64-linux-gnu REQUIRED)
+  find_path(CUDNN_INCLUDE_DIR cudnn.h
+    PATHS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/include/x86_64-linux-gnu REQUIRED)
+endif()
 
 # nlohmann/json, spdlog, cpp-httplib, cxxopts, gtest via FetchContent
 include(FetchContent)
@@ -91,6 +121,7 @@ add_library(fish_kernels STATIC
 
 target_include_directories(fish_kernels PUBLIC
   ${CMAKE_SOURCE_DIR}/src
+  ${CUDNN_INCLUDE_DIR}
 )
 
 target_link_libraries(fish_kernels PUBLIC
